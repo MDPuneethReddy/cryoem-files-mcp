@@ -1,0 +1,36 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cryoem-files-mcp"
+version = "0.1.0"
+description = "MCP server that lets AI assistants inspect, validate and convert cryo-EM files (MRC, TIFF, EER, gain references, STAR, mdoc)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "BSD-3-Clause"
+authors = [{ name = "Puneeth Reddy" }]
+keywords = ["cryo-em", "mcp", "mrc", "gain reference", "eer", "motioncor"]
+dependencies = [
+    "mcp>=2.3,<3",
+    "numpy>=1.24",
+    "mrcfile>=1.5",
+    "tifffile>=2024.1.30",
+    "imagecodecs>=2024.1.1",
+    "starfile>=0.5",
+    "mdocfile>=0.2",
+]
+
+[project.optional-dependencies]
+dm4 = ["ncempy>=1.11"]
+dev = ["pytest>=8"]
+
+[project.scripts]
+cryoem-files-mcp = "cryoem_files_mcp.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cryoem_files_mcp"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
