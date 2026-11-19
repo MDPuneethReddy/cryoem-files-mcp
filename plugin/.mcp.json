@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "cryoem-files": {
+      "command": "uvx",
+      "args": ["cryoem-files-mcp==0.1.0", "--root", "${user_config.data_folder}"]
+    }
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "name": "cryoem-files-mcp",
+  "owner": {
+    "name": "Puneeth Reddy",
+    "url": "https://github.com/MDPuneethReddy"
+  },
+  "description": "Cryo-EM file tools for Claude",
+  "plugins": [
+    {
+      "name": "cryoem-files",
+      "source": "./plugin",
+      "description": "Inspect, validate and fix cryo-EM files (MRC, TIFF/EER movies, gain references, STAR, mdoc)."
+    }
+  ]
+}

@@ -1,0 +1,30 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.MDPuneethReddy/cryoem-files-mcp",
+  "title": "Cryo-EM Files",
+  "description": "Inspect, validate and convert cryo-EM files: MRC, TIFF/EER movies, gain references, STAR, mdoc.",
+  "repository": {
+    "url": "https://github.com/MDPuneethReddy/cryoem-files-mcp",
+    "source": "github"
+  },
+  "version": "0.1.0",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "identifier": "cryoem-files-mcp",
+      "version": "0.1.0",
+      "transport": {
+        "type": "stdio"
+      },
+      "packageArguments": [
+        {
+          "type": "named",
+          "name": "--root",
+          "description": "Folder the tools may read (repeatable). Defaults to the current directory.",
+          "isRequired": false,
+          "format": "string"
+        }
+      ]
+    }
+  ]
+}

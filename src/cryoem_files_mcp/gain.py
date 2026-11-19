@@ -7,7 +7,7 @@ from pathlib import Path
 import mrcfile
 import numpy as np
 
-from .formats import Movie, read_2d, sample_stats
+from .formats import FileProblem, Movie, data_warnings, read_2d, sample_stats
 from .paths import output_path
 
 # The 8 distinct ways a gain can be rotated/flipped relative to the movie.
@@ -57,6 +57,12 @@ def inspect_gain(path: Path) -> dict:
         hints.append("Gatan gain (K2/K3): multiplicative. Orientation often differs from TIFF movies; check it.")
     if not result["normalised_near_1"]:
         hints.append("Mean is far from 1: this may not be a normalised gain reference.")
+    problems = data_warnings(g, "gain")
+    if good.size and (good < 0).any():
+        problems.append(f"{100 * (good < 0).mean():.3g}% of gain pixels are negative; a gain reference should be positive")
+    if result["zero_or_defect_pixels_pct"] > 5:
+        problems.append(f"{result['zero_or_defect_pixels_pct']}% of pixels are zero: far more defects than normal (<1%)")
+    result["problems"] = problems
     result["hints"] = hints
     return result
 
@@ -86,7 +92,12 @@ def check_orientation(gain_path: Path, movie_path: Path, n_frames: int = 20, cro
     correlates strongly with it (negative for multiplicative gains, positive for divisive ones);
     wrong variants correlate near zero.
     """
+    if n_frames < 1:
+        raise ValueError("n_frames must be at least 1")
     g, _ = read_2d(gain_path)
+    bad = data_warnings(g, "gain")
+    if any("every" in b or "same value" in b for b in bad):
+        raise FileProblem(gain_path, f"cannot be used for an orientation check: {bad[0]}.")
     with Movie(movie_path) as mv:
         if mv.dtype.startswith("float"):
             note = "Movie frames are float: they may already be gain-normalised, so the check can be weak."
@@ -94,6 +105,11 @@ def check_orientation(gain_path: Path, movie_path: Path, n_frames: int = 20, cro
             note = None
         s, used = mv.sum_frames(n_frames)
         movie_shape = mv.shape
+    if not np.isfinite(s).all():
+        raise FileProblem(movie_path, "frames contain NaN or infinite values; the orientation check needs raw counts.")
+    if s.max() == s.min():
+        raise FileProblem(movie_path, f"the first {used} frames are blank (every pixel = {s.max():g}).",
+                          cause="empty or failed exposure", fix="pick another movie from the session")
 
     scaling = None
     results = []
@@ -121,9 +137,13 @@ def check_orientation(gain_path: Path, movie_path: Path, n_frames: int = 20, cro
 
     scored = [x for x in results if x.get("r") is not None]
     if not scored:
-        return {
-            "error": f"Gain shape {list(g.shape)} does not match movie frame shape {list(movie_shape)} in any orientation",
-        }
+        raise FileProblem(
+            gain_path,
+            f"is {g.shape[1]}x{g.shape[0]} pixels but the movie frames are {movie_shape[1]}x{movie_shape[0]}; "
+            "they do not match in any orientation (or with 2x binning).",
+            cause="the gain belongs to a different detector, mode (counting vs super-resolution) or session",
+            fix="use the gain reference recorded with this session",
+        )
     scored.sort(key=lambda x: abs(x["r"]), reverse=True)
     best, runner = scored[0], (scored[1] if len(scored) > 1 else None)
     margin = abs(best["r"]) - (abs(runner["r"]) if runner else 0.0)
@@ -196,11 +216,26 @@ def convert_gain(
         applied.append("binned 2x (mean)")
     g = np.ascontiguousarray(g, dtype=np.float32)
 
-    dst = output_path(gain_path, out, ".mrc", overwrite=overwrite)
-    with mrcfile.new(dst, overwrite=True) as m:
-        m.set_data(g)
-        if pixel_size:
-            m.voxel_size = (pixel_size, pixel_size, pixel_size)
+    for w in data_warnings(g, "gain"):
+        if "every" in w or "same value" in w:
+            raise FileProblem(gain_path, f"cannot be converted: {w}.")
+    try:
+        dst = output_path(gain_path, out, ".mrc", overwrite=overwrite)
+    except PermissionError as e:
+        raise FileProblem(gain_path, f"output folder is not writable ({e.filename or e}).",
+                          fix="pass out= pointing to a folder you can write to") from None
+    tmp = dst.with_name(dst.name + ".partial")
+    try:
+        with mrcfile.new(tmp, overwrite=True) as m:
+            m.set_data(g)
+            if pixel_size:
+                m.voxel_size = (pixel_size, pixel_size, pixel_size)
+        tmp.replace(dst)  # never leave a half-written gain behind under the real name
+    except OSError as e:
+        tmp.unlink(missing_ok=True)
+        reason = "permission denied" if isinstance(e, PermissionError) else (e.strerror or str(e))
+        raise FileProblem(dst, f"could not be written: {reason}.",
+                          cause="no write permission or the disk is full", fix="pass out= pointing to a writable folder with free space") from None
     return {
         "output": str(dst),
         "input_format": fmt,

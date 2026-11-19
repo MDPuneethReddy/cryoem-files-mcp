@@ -1,0 +1,32 @@
+{
+  "name": "cryoem-files",
+  "displayName": "Cryo-EM Files",
+  "version": "0.1.0",
+  "description": "Inspect, validate and fix cryo-EM files (MRC, TIFF/EER movies, gain references, STAR, mdoc) on your own machine.",
+  "author": {
+    "name": "Puneeth Reddy",
+    "url": "https://mdpuneethreddy.com"
+  },
+  "homepage": "https://github.com/MDPuneethReddy/cryoem-files-mcp",
+  "repository": "https://github.com/MDPuneethReddy/cryoem-files-mcp",
+  "license": "BSD-3-Clause",
+  "keywords": [
+    "cryo-em",
+    "microscopy",
+    "mrc",
+    "gain-reference",
+    "motioncor",
+    "relion"
+  ],
+  "documentationUrl": "https://github.com/MDPuneethReddy/cryoem-files-mcp#readme",
+  "supportUrl": "https://github.com/MDPuneethReddy/cryoem-files-mcp/issues",
+  "userConfig": {
+    "data_folder": {
+      "type": "directory",
+      "title": "Cryo-EM data folder",
+      "description": "Top folder holding your sessions. The tools can only read files inside it.",
+      "required": true
+    }
+  },
+  "icon": "./.claude-plugin/icon.png"
+}

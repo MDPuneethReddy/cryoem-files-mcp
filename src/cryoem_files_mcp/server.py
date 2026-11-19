@@ -40,9 +40,11 @@ mcp = MCPServer(
 
 
 @mcp.tool(annotations=READ_ONLY)
-def identify_file(path: str) -> dict:
-    """Detect a file's real format from its contents (MRC, TIFF, EER, DM4, STAR, mdoc) and guess its role."""
-    return _call(lambda: insp.identify_file(resolve(path)))
+def identify_file(path: str, verify_data: bool = False) -> dict:
+    """Detect a file's real format from its contents, guess its role and check its integrity (truncation,
+    corrupted headers, wrong extension). verify_data=true also decodes every frame/pixel. Damage is reported
+    under 'problems' with the exact location (byte, frame) instead of failing."""
+    return _call(lambda: insp.identify_file(resolve(path), verify_data))
 
 
 @mcp.tool(annotations=READ_ONLY)
@@ -52,9 +54,10 @@ def inspect_mrc(path: str, validate: bool = True) -> dict:
 
 
 @mcp.tool(annotations=READ_ONLY)
-def inspect_movie(path: str, sample_frames: int = 5) -> dict:
-    """Summarise a TIFF, EER or MRC movie: frames, frame size, compression, counts per pixel, gain-normalised guess."""
-    return _call(lambda: insp.inspect_movie(resolve(path), sample_frames))
+def inspect_movie(path: str, sample_frames: int = 5, verify_all_frames: bool = False) -> dict:
+    """Summarise a TIFF, EER or MRC movie: frames, frame size, compression, counts per pixel, gain-normalised guess.
+    verify_all_frames=true decodes every frame and lists any corrupted ones."""
+    return _call(lambda: insp.inspect_movie(resolve(path), sample_frames, verify_all_frames))
 
 
 @mcp.tool(annotations=READ_ONLY)
