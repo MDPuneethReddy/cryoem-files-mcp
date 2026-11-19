@@ -62,13 +62,20 @@ def _text(path: Path, what: str) -> str:
     return text
 
 
-# STAR values may be quoted ('my mic 1.mrc' or "a b"); a quote only opens at the start of a value and only
-# closes when followed by whitespace or the end of the line, so quotes inside a value (it's) are kept.
+# STAR tokens, as RELION reads them (src/strings.cpp nextTokenForSTAR): a value may be quoted ('my mic 1.mrc',
+# "a b", or "" for an empty string); a quote only opens at the start of a value and only closes when followed by
+# whitespace or the end of the line, so quotes inside a value (it's) are kept. A token that starts with '#' begins
+# a comment that runs to the end of the line (RELION appends '# <comment>' to rows that have an rlnComment).
 _STAR_TOKEN = re.compile(r"""'.*?'(?=\s|$)|".*?"(?=\s|$)|\S+""")
 
 
 def _split_row(line: str) -> list[str]:
-    return _STAR_TOKEN.findall(line)
+    tokens = []
+    for t in _STAR_TOKEN.findall(line):
+        if t.startswith("#"):
+            break
+        tokens.append(t)
+    return tokens
 
 
 def _loop_row_problems(text: str) -> list[str]:
@@ -77,7 +84,7 @@ def _loop_row_problems(text: str) -> list[str]:
     block, cols, in_loop, data_started = None, 0, False, False
     for ln, line in enumerate(text.splitlines(), 1):
         s = line.strip()
-        if not s or s.startswith("#"):
+        if not s or s.startswith(("#", ";")):
             continue
         if s.startswith("data_"):
             block, cols, in_loop, data_started = s, 0, False, False

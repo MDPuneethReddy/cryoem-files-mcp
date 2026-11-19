@@ -15,7 +15,7 @@ Runs locally over stdio. Nothing is uploaded; there is no server to host.
 | `inspect_movie` | Frames, size, compression, counts/pixel/frame, gain-normalised guess (TIFF, EER, MRC) | No |
 | `inspect_gain` | Size, value range, defect pixels, convention hints | No |
 | `check_gain_orientation` | Scores all 8 rotations/flips of the gain against raw frames; reports the best match with a significance-based confidence (`high`, `medium`, `low`, `no_match`) and the multiply-vs-divide convention | No |
-| `convert_gain` | Float32 MRC gain with rotate/flip/2x-bin/invert baked in (applied in that order) | New file only |
+| `convert_gain` | Float32 MRC gain with rotate/flip/2x-bin/invert baked in (applied in that order), plus the row flip TIFF movies need (`movie_type='tiff'`) | New file (overwrites only with `overwrite=true`) |
 | `summarize_star` | RELION STAR blocks, optics groups, defocus/CTF/class stats | No |
 | `parse_mdoc` | SerialEM tilt range, step, dose, pixel size | No |
 | `scan_directory` | File counts by type, gain references found, obvious problems. `max_depth` (default 8 folder levels), `limit` (default 20,000 files); reports what it skipped | No |
@@ -55,7 +55,7 @@ Claude Desktop (`claude_desktop_config.json`):
 }
 ```
 
-`--root` (repeatable, or `CRYOEM_MCP_ROOTS`) limits which folders the tools can read. Default: the current directory. The server refuses to start (exit code 2, reason on stderr) if a root does not exist or is not a folder.
+`--root` (repeatable, or `CRYOEM_MCP_ROOTS`) sets which folders the tools can read. It is required: the server does not fall back to the current directory, because MCP clients often start servers in `/` or your home folder. The server refuses to start (exit code 2, reason on stderr) if no root is given, or a root does not exist or is not a folder.
 
 `--timeout` (or `CRYOEM_MCP_TIMEOUT`, default 300 seconds) is the longest a single tool call may run before it returns an error.
 
@@ -78,7 +78,14 @@ Confidence is a significance test, not a fixed correlation cut-off. For a gain t
 
 Calibration on simulated data (`python3 scripts/calibrate_orientation.py --full`): 120 unrelated same-size gains gave best z of at most 3.1 (all `no_match`; 50 more with strong shared row/column stripes, at most 3.0); correct gains with 2% and 1% pixel variation at 0.5 e/px/frame, 20 frames, 512x512 gave z of about 32 and 16 (all `high`); a Falcon-style 8K gain with 4% variation against a 4K movie gave z = 88 (`high`).
 
-`convert_gain` can then bake the winning orientation (and the inversion, if needed) into a new MRC, so MotionCor runs with `-RotGain 0 -FlipGain 0` and no `-InvGain`.
+Variant names are in array view: `rot90` means `numpy.rot90(gain, 1)`, counter-clockwise with row 0 at the top. MotionCor's `-RotGain k` turns the other way in that view (its help assumes y pointing up), so the tool's `rotate=k` corresponds to `-RotGain (4-k)%4`.
+
+`convert_gain` can then bake the winning orientation (and the inversion, if needed) into a new MRC, so MotionCor runs with `-RotGain 0 -FlipGain 0` and no `-InvGain`. Two program details matter, both from the MotionCor3 and RELION source code:
+
+- **Row order.** MotionCor and RELION read TIFF movie rows bottom-up, but MRC (and EER) rows as stored. A gain matched to a TIFF movie is therefore written upside down (`movie_type='tiff'`). EER and MRC movies need no flip.
+- **RELION and EER.** RELION picks the gain convention for EER movies from the file extension: it multiplies by a `.gain` file and divides by anything else, MRC included. For RELION with EER, keep the original `.gain` or write a divisive MRC. For TIFF and MRC movies RELION multiplies, like MotionCor.
+
+`check_gain_orientation` returns the exact `convert_gain` call for MotionCor and for RELION in `next_step`.
 
 ## Safety
 
@@ -90,9 +97,13 @@ Calibration on simulated data (`python3 scripts/calibrate_orientation.py --full`
 
 ## Status and known limits (v0.1)
 
-- 91 tests on synthetic data: all 8 orientations, both conventions, 4K/8K binning, and ~45 damaged or unusual files. Needs validation on real K3 and Falcon 4 datasets from EMPIAR.
+- **Check one movie first.** The gain row order and MotionCor/RELION conventions come from reading their source code, not from a run on real data. Before processing a whole dataset with a converted gain, run motion correction on one movie and check that the corrected sum shows no detector pattern (seams, stripes).
+- Tested only on synthetic data (all 8 orientations, both conventions, 4K/8K binning, ~50 damaged or unusual files). Not yet validated on real K3, Falcon 4 or EER datasets; please report results.
+- EER support is untested on real files.
 - `.dm4` reading uses `ncempy` and is untested on real Gatan gains; compare against IMOD `dm2mrc` before trusting it.
-- Assumes MotionCor reads TIFF/EER movies and MRC gains in the same row order as `tifffile`/`mrcfile`. Confirm once on a real dataset.
+- CryoSPARC statements (EER gain size, `.dm4`) come from CryoSPARC forum reports (2021, 2023), not the official guide.
+- `scan_directory` reports when it did not look at everything (deeper folders, MRC header-check cap); read its notes.
+- Tested on Linux. macOS and Windows are untested.
 
 ## Publishing
 

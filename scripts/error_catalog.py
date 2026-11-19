@@ -1,6 +1,7 @@
 """Build damaged files, run the tools on them and write docs/error-messages.md with the exact messages users see."""
 
 import os
+import random
 import sys
 import tempfile
 from pathlib import Path
@@ -8,6 +9,10 @@ from pathlib import Path
 import mrcfile
 import numpy as np
 import tifffile
+
+# deterministic output: the "random" damage is seeded, and the temp folder is shown as <data folder>
+_rng = random.Random(1234)
+os.urandom = lambda n: _rng.randbytes(n)  # noqa: E731
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tests.conftest import make_gain, make_movie  # noqa: E402
@@ -30,6 +35,7 @@ def case(title, fn, *a, **k):
         kind = "reported"
     except Exception as e:
         msg, kind = str(e), "error"
+    msg = msg.replace(str(d), "<data folder>")
     rows.append((title, kind, msg.replace("|", "\\|").replace("\n", " ")))
 
 
@@ -96,6 +102,7 @@ tifffile.imwrite(d / "raw.tif", rng.poisson(3, (20, 256, 256)).astype(np.uint8))
 tifffile.imwrite(d / "other.gain", make_gain((256, 256), seed=9))
 case("Gain that does not belong to the movie (orientation)", check_orientation, d / "other.gain", d / "raw.tif")
 case("Invalid scan limit", scan_directory, s, limit=-5)
+case("convert_gain with an unknown movie_type", convert_gain, d / "g64.gain", movie_type="dm4")
 
 out = Path(__file__).resolve().parents[1] / "docs" / "error-messages.md"
 lines = ["# Error messages for damaged files", "",

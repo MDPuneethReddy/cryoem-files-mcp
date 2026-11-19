@@ -11,8 +11,20 @@ from .formats import FORMAT_NAMES, FileProblem, Movie, data_warnings, read_2d, s
 from .paths import output_path
 
 # The 8 distinct ways a gain can be rotated/flipped relative to the movie.
-# Each is: rotate counter-clockwise by k*90 degrees (numpy rot90), then optionally flip rows (upside down).
+# Each is numpy.rot90(gain, k) -- counter-clockwise as seen in array view (row 0 at the top, like tifffile/imshow)
+# -- then optionally numpy.flipud. Note MotionCor's -RotGain k is numpy.rot90(gain, -k) in the same array view
+# (its "counter-clockwise" assumes y pointing up), so the equivalent MotionCor flag is -RotGain (4-k)%4.
 VARIANTS = [(k, flip) for k in range(4) for flip in (False, True)]
+
+
+VARIANT_CONVENTION = ("rotN = numpy.rot90(gain, N/90): counter-clockwise in array view (row 0 at the top); "
+                      "+flip_y = then numpy.flipud. Not the same direction as MotionCor's -RotGain.")
+
+# How the programs read rows (MotionCor3 TiffUtil/CLoadTiffImage.cpp, RELION src/rwTIFF.h): TIFF rows are
+# flipped bottom-up on load; MRC and EER rows are used as stored. tifffile and mrcfile keep file order.
+MOVIE_TYPES = {"tiff": "tiff", "bigtiff": "tiff", "eer": "eer", "mrc": "mrc"}
+VERIFY_FIRST = ("Not yet validated on real data: before processing a whole dataset, run motion correction on one "
+                "movie with this gain and check that the corrected sum shows no detector pattern (seams, stripes).")
 
 
 def variant_name(k: int, flip: bool) -> str:
@@ -47,12 +59,13 @@ def inspect_gain(path: Path) -> dict:
     hints = []
     if g.shape in ((8192, 8192), (4096, 4096)) and fmt in ("tiff", "bigtiff", "eer", "mrc"):
         hints.append(
-            "Square 4K/8K gain: likely Falcon. Falcon TIFF .gain files are multiplicative; "
-            "older Falcon MRC gains for EER are divisive (RELION divides by an MRC gain for EER). "
-            "Run check_gain_orientation against a movie to confirm the convention."
+            "Square 4K/8K gain: likely Falcon. Falcon TIFF .gain files are multiplicative; older Falcon MRC gains "
+            "for EER are divisive. RELION decides by file extension for EER movies: it multiplies by a .gain file "
+            "and divides by any other gain (MRC included). Run check_gain_orientation against a movie to confirm."
         )
     if g.shape == (8192, 8192):
-        hints.append("8K gain: CryoSPARC expects a 4096x4096 gain for EER; use convert_gain with bin=2.")
+        hints.append("8K gain: according to CryoSPARC forum reports (2021), CryoSPARC needs a 4096x4096 gain for EER; "
+                     "use convert_gain with bin=2 (and invert=true for an old divisive MRC gain).")
     if fmt in ("dm4", "dm3"):
         hints.append("Gatan gain (K2/K3): multiplicative. Orientation often differs from TIFF movies; check it.")
     if not result["normalised_near_1"]:
@@ -120,11 +133,12 @@ def check_orientation(gain_path: Path, movie_path: Path, n_frames: int = 20, cro
     """
     if not 1 <= n_frames <= 10_000:
         raise ValueError("n_frames must be at least 1 and at most 10000")
-    g, _ = read_2d(gain_path)
+    g, gain_fmt = read_2d(gain_path)
     bad = data_warnings(g, "gain")
     if any("every" in b or "same value" in b for b in bad):
         raise FileProblem(gain_path, f"cannot be used for an orientation check: {bad[0]}.")
     with Movie(movie_path) as mv:
+        movie_type = MOVIE_TYPES[mv.format]
         if mv.dtype.startswith("float"):
             note = "Movie frames are float: they may already be gain-normalised, so the check can be weak."
         else:
@@ -217,16 +231,18 @@ def check_orientation(gain_path: Path, movie_path: Path, n_frames: int = 20, cro
                 "integer-count movie; with very low dose, raise n_frames",
         ))
     else:
-        convention = "multiply (raw x gain)" if best["r"] < 0 else "divide (raw / gain)"
-        out["gain_convention"] = convention
-        step = (f"convert_gain with rotate={best['rot90_ccw']}, flip='{'y' if best['flip_y'] else 'none'}'"
-                + (", invert=true" if best["r"] > 0 else "")
-                + " writes a multiplicative MRC gain already matched to the movie; then run MotionCor with "
-                  "-RotGain 0 -FlipGain 0 (and no -InvGain).")
+        divisive = best["r"] > 0
+        out["gain_convention"] = "divide (raw / gain)" if divisive else "multiply (raw x gain)"
+        out["movie_type"] = movie_type
+        out["variant_convention"] = VARIANT_CONVENTION
+        step = _advice(gain_path, gain_fmt, movie_type, best["rot90_ccw"], best["flip_y"], divisive, scaling)
+        if gain_fmt == "mrc" and not scaling:
+            out["motioncor_flags_for_original_gain"] = _motioncor_flags(movie_type, best["rot90_ccw"], best["flip_y"],
+                                                                         divisive)
         if confidence == "high":
             out["next_step"] = step
         elif confidence == "medium":
-            out["next_step"] = "Probably: " + step
+            out["next_step"] = {k: "Probably: " + v for k, v in step.items()}
             out["warning"] = (f"The match is real (z={z_best:g}) but {best['variant']} is only {gap:g} z ahead of "
                               f"{runner['variant'] if runner else 'the next variant'}. Re-run with more frames "
                               "(n_frames=50+) to confirm before converting.")
@@ -242,6 +258,46 @@ def check_orientation(gain_path: Path, movie_path: Path, n_frames: int = 20, cro
     return out
 
 
+def _convert_call(k: int, flip: bool, invert: bool, movie_type: str) -> str:
+    return (f"convert_gain(rotate={k}, flip='{'y' if flip else 'none'}'" + (", invert=true" if invert else "")
+            + f", movie_type='{movie_type}')")
+
+
+def _advice(gain_path: Path, gain_fmt: str, movie_type: str, k: int, flip: bool, divisive: bool,
+            scaling: str | None) -> dict:
+    """Exact conversion for MotionCor and for RELION, given what each program does with rows and conventions."""
+    rows = (" It also flips rows, because MotionCor and RELION read TIFF movie rows bottom-up but MRC gain rows "
+            "as stored." if movie_type == "tiff" else "")
+    mc = (f"{_convert_call(k, flip, divisive, movie_type)} writes a multiplicative MRC gain matched to the movie as "
+          f"MotionCor reads it.{rows} Then MotionCor: -Gain <output> -RotGain 0 -FlipGain 0, no -InvGain.")
+    if movie_type == "eer":
+        if gain_path.name.lower().endswith(".gain") and gain_fmt in ("tiff", "bigtiff") and not divisive \
+                and k == 0 and not flip:
+            relion = ("Use the original .gain file as is: RELION multiplies by a .gain file for EER movies and "
+                      "this one already matches.")
+        else:
+            relion = (f"{_convert_call(k, flip, not divisive, movie_type)} writes a divisive MRC gain: RELION divides "
+                      "by any gain that is not a .gain file for EER movies. Give it to RELION with no gain "
+                      "rotation or flip. (This file is not the one for MotionCor.)")
+    else:
+        relion = (f"{_convert_call(k, flip, divisive, movie_type)} (the same file as for MotionCor) writes a "
+                  f"multiplicative MRC gain.{rows} Give it to RELION's motion correction with no gain rotation or flip.")
+    out = {"motioncor": mc, "relion": relion, "check_first": VERIFY_FIRST}
+    if scaling and scaling.startswith("gain binned"):
+        out["size"] = ("The gain is 2x the movie size. Add bin=2 if your program needs a gain of the movie's size "
+                       "(CryoSPARC for EER, according to forum reports); RELION resamples EER gains itself.")
+    return out
+
+
+def _motioncor_flags(movie_type: str, k: int, flip: bool, divisive: bool) -> str:
+    """MotionCor flags for using the original MRC gain unconverted. MotionCor rotates (-RotGain k' ==
+    numpy.rot90(g, -k')), then flips (1 = flipud), then inverts. A TIFF movie is read bottom-up, so the gain
+    needs one extra vertical flip, which cancels or adds -FlipGain 1."""
+    flip_gain = (not flip) if movie_type == "tiff" else flip
+    return (f"-RotGain {(4 - k) % 4} -FlipGain {1 if flip_gain else 0}" + (" -InvGain" if divisive else "")
+            + " (only with the original MRC gain file; not with a converted one)")
+
+
 def convert_gain(
     gain_path: Path,
     out: str | None = None,
@@ -251,14 +307,18 @@ def convert_gain(
     bin: int = 1,
     pixel_size: float | None = None,
     overwrite: bool = False,
+    movie_type: str | None = None,
 ) -> dict:
-    """Write the gain as a float32 MRC, applying rotate (ccw, x90), then flip, then 2x binning, then inversion."""
+    """Write the gain as a float32 MRC, applying rotate (numpy.rot90, ccw in array view), then flip, then 2x
+    binning, then inversion, then (for TIFF movies) a row flip to MotionCor/RELION's row order."""
     if rotate not in (0, 1, 2, 3):
         raise ValueError("rotate must be 0, 1, 2 or 3 (multiples of 90 degrees counter-clockwise)")
     if flip not in ("none", "y", "x"):
         raise ValueError("flip must be 'none', 'y' (upside down) or 'x' (left-right)")
     if bin not in (1, 2):
         raise ValueError("bin must be 1 or 2")
+    if movie_type not in (None, "tiff", "eer", "mrc"):
+        raise ValueError("movie_type must be 'tiff', 'eer' or 'mrc' (the format of the movies this gain is for)")
     g, fmt = read_2d(gain_path)
     applied = []
     g = np.rot90(g, rotate)
@@ -281,6 +341,12 @@ def convert_gain(
         inv[safe] = 1.0 / g[safe]
         g = inv
         applied.append("inverted (1/gain; zero/defect pixels stay 0)")
+    if movie_type == "tiff":
+        # MotionCor and RELION read TIFF movie rows bottom-up but MRC rows as stored; the orientation was
+        # matched to the movie as tifffile reads it (top-down), so flip once more for what they will see
+        g = np.flipud(g)
+        applied.append("flipped upside down for TIFF movies (MotionCor and RELION read TIFF rows bottom-up, "
+                       "MRC gain rows as stored)")
     g = np.ascontiguousarray(g, dtype=np.float32)
 
     for w in data_warnings(g, "gain"):
@@ -303,11 +369,24 @@ def convert_gain(
         reason = "permission denied" if isinstance(e, PermissionError) else (e.strerror or str(e))
         raise FileProblem(dst, f"could not be written: {reason}.",
                           cause="no write permission or the disk is full", fix="pass out= pointing to a writable folder with free space") from None
-    return {
+    result = {
         "output": str(dst),
         "input_format": FORMAT_NAMES[fmt],
         "shape_yx": list(g.shape),
         "applied": applied or ["no transform (format conversion only)"],
         "stats": sample_stats(g),
-        "use_with_motioncor": "-Gain <output> -RotGain 0 -FlipGain 0" + ("" if invert else " (multiplicative)"),
+        "convention": (f"the output is the input gain{' inverted (1/gain)' if invert else ''}: multiplicative if the "
+                       f"input was {'divisive' if invert else 'multiplicative (K2/K3, Falcon .gain)'}"),
+        "use_with_motioncor": "-Gain <output> -RotGain 0 -FlipGain 0, no -InvGain (for a multiplicative output)",
+        "use_with_relion": ("for EER movies RELION divides by any gain that is not a .gain file, so give it a divisive "
+                            "MRC (or the original .gain); for TIFF/MRC movies it multiplies, like MotionCor"),
+        "check_first": VERIFY_FIRST,
     }
+    if movie_type is None:
+        result["row_order"] = ("movie_type not given: rows are kept in file order, which is right for EER and MRC "
+                               "movies. For TIFF movies pass movie_type='tiff' (MotionCor and RELION read TIFF movie "
+                               "rows bottom-up).")
+    elif movie_type == "tiff":
+        result["row_order"] = ("rows flipped for TIFF movies: check_gain_orientation on this output against the "
+                               "TIFF movie will now report rot0+flip_y; that is expected")
+    return result

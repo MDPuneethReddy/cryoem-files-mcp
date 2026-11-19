@@ -29,7 +29,7 @@ def test_divisive_gain_detected_and_inverted(tmp_path):
     make_movie(tmp_path / "movie.tif", g, 1, True, convention="divide")
     r = check_orientation(tmp_path / "eer_gain.mrc", tmp_path / "movie.tif")
     assert r["gain_convention"].startswith("divide")
-    assert "invert=true" in r["next_step"]
+    assert "invert=true" in r["next_step"]["motioncor"]  # next_step is per program since 0.1.1
     out = convert_gain(tmp_path / "eer_gain.mrc", rotate=r["rot90_ccw"], flip="y" if r["flip_y"] else "none", invert=True)
     # the converted gain must now be multiplicative and aligned: check again against the movie
     r2 = check_orientation(resolve(out["output"]), tmp_path / "movie.tif")

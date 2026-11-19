@@ -102,7 +102,7 @@ def test_weak_realistic_gain_is_high(tmp_path, var):
     r = check_orientation(tmp_path / "g.gain", tmp_path / "m.tif")
     assert r["confidence"] == "high" and r["z_best"] >= 10 and r["z_gap"] >= 6
     assert np.array_equal(transform(g, r["rot90_ccw"], r["flip_y"]), transform(g, 3, True))
-    assert r["next_step"].startswith("convert_gain")
+    assert r["next_step"]["motioncor"].startswith("convert_gain")
 
 
 def test_super_resolution_gain_binned_to_counting_movie_is_high(tmp_path):
@@ -296,3 +296,134 @@ def test_argument_errors_are_short(tmp_path):
     msg = anyio.run(go)
     assert "limit: input should be greater than or equal to 1 (got -5)" in msg
     assert "pydantic" not in msg and "http" not in msg and "\n" not in msg
+
+
+# ================================================================== pass 2 (docs/RESEARCH-NOTES.md, RELEASE-PLAN.md)
+
+import re  # noqa: E402
+
+from cryoem_files_mcp.gain import _advice  # noqa: E402
+
+
+def _motioncor_view_of_gain(g_file: np.ndarray, flags: str) -> np.ndarray:
+    """What MotionCor3 does to an MRC gain: -RotGain k == numpy.rot90(g, -k), then -FlipGain 1 == flipud."""
+    k = int(re.search(r"-RotGain (\d)", flags).group(1))
+    f = int(re.search(r"-FlipGain (\d)", flags).group(1))
+    out = np.rot90(g_file, -k)
+    return np.flipud(out) if f == 1 else out
+
+
+@pytest.mark.parametrize("k,flip", VARIANTS)
+def test_tiff_movie_gain_is_written_in_motioncor_row_order(tmp_path, k, flip):
+    """Item 1/3: MotionCor and RELION read TIFF movie rows bottom-up and MRC gain rows as stored."""
+    g = make_gain((96, 128), seed=k * 2 + flip)
+    with mrcfile.new(tmp_path / "g.mrc") as m:
+        m.set_data(g)
+    _movie(tmp_path / "m.tif", g, k, flip, 3.0, 20, 5)
+    r = check_orientation(tmp_path / "g.mrc", tmp_path / "m.tif")
+    assert r["confidence"] == "high" and r["movie_type"] == "tiff"
+    assert "movie_type='tiff'" in r["next_step"]["motioncor"]
+    # the fixed pattern MotionCor sees in the TIFF movie is the tifffile pattern flipped upside down
+    seen_by_motioncor = np.flipud(transform(g, k, flip))
+    out = convert_gain(tmp_path / "g.mrc", rotate=r["rot90_ccw"], flip="y" if r["flip_y"] else "none", movie_type="tiff")
+    with mrcfile.open(out["output"]) as m:
+        assert np.array_equal(np.array(m.data), seen_by_motioncor)
+    assert any("TIFF movies" in a for a in out["applied"])
+    # flags for the original MRC gain: (4-k)%4 and the extra flip
+    assert np.array_equal(_motioncor_view_of_gain(g, r["motioncor_flags_for_original_gain"]), seen_by_motioncor)
+
+
+@pytest.mark.parametrize("k,flip", [(1, False), (3, True)])
+def test_mrc_movie_gain_kept_in_file_order(tmp_path, k, flip):
+    g = make_gain((64, 64), seed=4)
+    with mrcfile.new(tmp_path / "g.mrc") as m:
+        m.set_data(g)
+    lam = 3.0 / np.where(transform(g, k, flip) > 0, transform(g, k, flip), 1.0)
+    with mrcfile.new(tmp_path / "movie_frames.mrc") as m:
+        m.set_data(np.random.default_rng(1).poisson(lam, (20, 64, 64)).astype(np.int16))
+    r = check_orientation(tmp_path / "g.mrc", tmp_path / "movie_frames.mrc")
+    assert r["movie_type"] == "mrc" and "movie_type='mrc'" in r["next_step"]["motioncor"]
+    flags = r["motioncor_flags_for_original_gain"]
+    assert flags.startswith(f"-RotGain {(4 - k) % 4} ")
+    assert np.array_equal(_motioncor_view_of_gain(g, flags), transform(g, k, flip))
+    out = convert_gain(tmp_path / "g.mrc", rotate=k, flip="y" if flip else "none", movie_type="mrc")
+    with mrcfile.open(out["output"]) as m:
+        assert np.array_equal(np.array(m.data), transform(g, k, flip))
+
+
+def test_convert_without_movie_type_explains_row_order(tmp_path):
+    tifffile.imwrite(tmp_path / "g.gain", make_gain((32, 32)))
+    out = convert_gain(tmp_path / "g.gain")
+    assert "movie_type='tiff'" in out["row_order"]
+    assert "check" in out["check_first"] and "-RotGain 0 -FlipGain 0" in out["use_with_motioncor"]
+    assert "movie_type must be" in err(convert_gain, tmp_path / "g.gain", movie_type="dm4")
+
+
+def test_relion_eer_advice_depends_on_extension_and_convention(tmp_path):
+    """Item 2: RELION multiplies by .gain for EER and divides by anything else (MRC included)."""
+    falcon = _advice(tmp_path / "Gain.gain", "tiff", "eer", 0, False, False, None)
+    assert "original .gain" in falcon["relion"]
+    assert "invert" not in falcon["motioncor"] and "movie_type='eer'" in falcon["motioncor"]
+    rotated = _advice(tmp_path / "Gain.gain", "tiff", "eer", 1, False, False, None)
+    assert "invert=true" in rotated["relion"] and "divisive MRC" in rotated["relion"]
+    old_mrc = _advice(tmp_path / "eer_gain.mrc", "mrc", "eer", 0, False, True, None)
+    assert "invert=true" in old_mrc["motioncor"] and "invert=true" not in old_mrc["relion"]
+    tiff = _advice(tmp_path / "k3.dm4", "dm4", "tiff", 2, True, False, None)
+    assert tiff["relion"].startswith(tiff["motioncor"].split(" writes")[0]) and "bottom-up" in tiff["relion"]
+    assert "one movie" in tiff["check_first"]
+
+
+# ------------------------------------------------------------------ item 4: STAR "" and comments
+
+STAR_RELION_STYLE = """
+# version 50001
+
+data_micrographs
+
+loop_
+_rlnMicrographName #1
+_rlnDefocusU #2
+_rlnComment #3
+"my mic 1.mrc" 12000 ""
+plain.mrc 13000 "" # flagged by user
+other.mrc 14000 ok
+"""
+
+
+def test_star_empty_quotes_and_trailing_comments(tmp_path):
+    (tmp_path / "r.star").write_text(STAR_RELION_STYLE)
+    r = summarize_star(tmp_path / "r.star")
+    assert "problems" not in r and r["blocks"]["micrographs"]["rows"] == 3
+    (tmp_path / "bad.star").write_text(STAR_RELION_STYLE.replace("other.mrc 14000 ok", "other.mrc 14000 ok extra # c"))
+    assert "4 values but 3 columns" in err(summarize_star, tmp_path / "bad.star")
+
+
+# ------------------------------------------------------------------ item 5 (PM-3): no implicit root
+
+def test_no_root_refuses_to_start(tmp_path):
+    env = {k: v for k, v in os.environ.items() if k != "CRYOEM_MCP_ROOTS"}
+    for cwd in ("/", os.path.expanduser("~"), str(tmp_path)):
+        p = subprocess.run([sys.executable, "-m", "cryoem_files_mcp.server"], capture_output=True, text=True,
+                           timeout=60, env=env, cwd=cwd, stdin=subprocess.DEVNULL)
+        assert p.returncode == 2 and "--root" in p.stderr and "CRYOEM_MCP_ROOTS" in p.stderr
+
+
+# ------------------------------------------------------------------ item 7 (PM-5): unexpected errors
+
+def test_unexpected_exception_is_reported_without_traceback(tmp_path, monkeypatch, capsys):
+    (tmp_path / "x.mrc").write_bytes(b"x")
+
+    def boom(*a, **k):
+        raise RuntimeError("boom\nsecond line")
+
+    monkeypatch.setattr(insp, "identify_file", boom)
+
+    async def go():
+        with pytest.raises(server.ToolError) as e:
+            await server.mcp.call_tool("identify_file", {"path": "x.mrc"})
+        return str(e.value)
+
+    msg = anyio.run(go)
+    assert "internal error in identify_file: RuntimeError: boom second line." in msg
+    assert server.ISSUES_URL in msg and "Traceback" not in msg and "\n" not in msg
+    assert "Traceback" in capsys.readouterr().err
