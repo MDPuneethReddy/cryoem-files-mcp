@@ -26,18 +26,43 @@ def get_roots() -> list[Path]:
     return _roots
 
 
+def is_allowed(p: Path) -> bool:
+    """True if an already-resolved path lies inside one of the allowed roots."""
+    return any(p == r or r in p.parents for r in get_roots())
+
+
+def display(p: Path) -> str:
+    """Show a path relative to its root (never the absolute path)."""
+    for r in get_roots():
+        if p == r:
+            return "."
+        if r in p.parents:
+            return str(p.relative_to(r))
+    return p.name
+
+
 def resolve(path: str, must_exist: bool = True) -> Path:
-    """Resolve a user path (relative paths are relative to the first root) and check it is allowed."""
+    """Resolve a user path (relative paths are relative to the first root) and check it is allowed.
+
+    Error messages repeat the path as the caller gave it: they never reveal where a symlink points.
+    """
     roots = get_roots()
     p = Path(path).expanduser()
     if not p.is_absolute():
         p = roots[0] / p
     p = p.resolve()
-    if not any(p == r or r in p.parents for r in roots):
+    if not is_allowed(p):
         allowed = ", ".join(str(r) for r in roots)
-        raise PathNotAllowed(f"{p} is outside the allowed folders ({allowed}). Start the server with --root to allow it.")
+        raise PathNotAllowed(
+            f"{path}: is outside the allowed folders ({allowed}). Likely cause: an absolute path, '..', or a "
+            "symlink that points outside them. Fix: use a path inside the allowed folders, or start the server "
+            "with --root for the folder you need."
+        )
     if must_exist and not p.exists():
-        raise FileNotFoundError(f"{p} does not exist")
+        raise FileNotFoundError(
+            f"{display(p)}: does not exist. Likely cause: wrong path, or the file was moved or deleted. "
+            f"Fix: check the name; relative paths start at {roots[0]}."
+        )
     return p
 
 
@@ -56,7 +81,7 @@ def output_path(src: Path, out: str | None, suffix: str = ".mrc", overwrite: boo
     if dst == src:
         dst = src.with_name(_stem(src) + "_converted" + suffix)
     if dst.exists() and not overwrite:
-        raise FileExistsError(f"{dst} already exists; pass overwrite=true to replace it")
+        raise FileExistsError(f"{display(dst)}: already exists. Fix: pass overwrite=true to replace it, or choose another out=.")
     dst.parent.mkdir(parents=True, exist_ok=True)
     return dst
 

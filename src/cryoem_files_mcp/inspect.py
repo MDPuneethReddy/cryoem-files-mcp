@@ -23,8 +23,11 @@ from .formats import (
     open_mrc,
     open_tiff,
     plural,
+    regular_stat,
     sample_stats,
+    special_kind,
 )
+from .paths import display, is_allowed
 
 
 def _size(n: float) -> str:
@@ -39,6 +42,7 @@ def identify_file(path: Path, verify_data: bool = False) -> dict:
     """Detect the real format, guess the role and check integrity. Never raises for a damaged file:
     damage is reported under 'problems' so the user sees exactly what is wrong."""
     out: dict = {"file": path.name}
+    regular_stat(path)  # a folder, pipe or device is a usage error, not a damaged file: raise (never open it)
     try:
         fmt = check_format(path)
     except FileProblem as e:
@@ -76,16 +80,7 @@ def identify_file(path: Path, verify_data: bool = False) -> dict:
                 shape = m.data.shape
                 notes += m.integrity["warnings"]
                 out.update({"shape": list(shape), "mode": int(m.header.mode)})
-                if "gain" in name:
-                    role = "gain reference"
-                elif len(shape) == 2:
-                    role = "micrograph or 2D image"
-                elif name.endswith(".mrcs") or (shape[0] > 1 and shape[1] < 1024):
-                    role = "particle stack"
-                elif shape[0] == shape[1] == shape[2]:
-                    role = "3D map/volume"
-                else:
-                    role = "movie or stack"
+                role = _mrc_role(name, shape)
                 if verify_data:
                     problems += [f"data: {w}" for w in data_warnings(m.data)]
             finally:
@@ -104,12 +99,33 @@ def identify_file(path: Path, verify_data: bool = False) -> dict:
     except FileProblem as e:
         problems.append(str(e))
     out["role_guess"] = role
-    out["integrity"] = "damaged" if problems else ("ok" if verify_data else "header ok (pass verify_data=true to decode all data)")
+    if problems:
+        out["integrity"] = "damaged"
+    elif fmt == "unknown":
+        out["integrity"] = "unrecognised format: not checked"
+    elif fmt in ("star", "mdoc"):
+        out["integrity"] = "text file: use summarize_star or parse_mdoc to check its contents"
+    else:
+        out["integrity"] = "ok" if verify_data else "header ok (pass verify_data=true to decode all data)"
     if problems:
         out["problems"] = problems
     if notes:
         out["notes"] = notes
     return out
+
+
+def _mrc_role(name: str, shape: tuple) -> str:
+    """Guess what an MRC holds from its name and shape (z, y, x)."""
+    if "gain" in name:
+        return "gain reference"
+    if len(shape) == 2 or shape[0] == 1:
+        return "micrograph or 2D image"
+    nz, ny, nx = shape[0], shape[1], shape[2]
+    if nz == ny == nx:
+        return "3D map/volume"
+    if name.endswith(".mrcs") or (nz > 50 and ny == nx and ny <= 512):
+        return "particle stack"
+    return "movie or image stack"
 
 
 def _bad_frames(mv: Movie) -> str | None:
@@ -175,8 +191,8 @@ def inspect_mrc(path: Path, validate: bool = True) -> dict:
 
 
 def inspect_movie(path: Path, sample_frames: int = 5, verify_all_frames: bool = False) -> dict:
-    if sample_frames < 1:
-        raise ValueError("sample_frames must be at least 1")
+    if not 1 <= sample_frames <= 10_000:
+        raise ValueError("sample_frames must be at least 1 and at most 10000")
     with Movie(path) as mv:
         s, used = mv.sum_frames(sample_frames)
         per_frame = s / used
@@ -215,7 +231,38 @@ def inspect_movie(path: Path, sample_frames: int = 5, verify_all_frames: bool = 
     return out
 
 
-def scan_directory(root: Path, pattern: str = "*", limit: int = 20000, max_depth: int = 4) -> dict:
+MRC_HEADER_CHECKS = 500  # header-vs-size checks per scan (1 KB read each)
+TIFF_MAGIC = (b"II*\x00", b"MM\x00*", b"II+\x00", b"MM\x00+")
+
+
+def _is_movie(p: Path, low: str, size: int) -> bool:
+    """Heuristic: does this file look like a raw movie? Small .tif files are checked for the TIFF signature."""
+    ext = p.suffix.lower()
+    if ext == ".eer":
+        return not low.endswith(".gain.eer")
+    if ext in (".tif", ".tiff"):
+        if size < 1_000_000:  # tiny files: only count real TIFFs (a 3-byte text file named .tif is not a movie)
+            try:
+                with open(p, "rb") as f:
+                    return f.read(4) in TIFF_MAGIC
+            except OSError:
+                return False
+        return True
+    if ext in (".mrc", ".mrcs"):
+        return any(w in low for w in ("frame", "movie", "fractions"))
+    return False
+
+
+def scan_directory(root: Path, pattern: str = "*", limit: int = 20000, max_depth: int = 8) -> dict:
+    """Count files by type under root. max_depth counts folder levels, the given folder being level 1.
+
+    Never opens anything that is not a regular file, and never follows or reads a symlink whose target is
+    outside the allowed folders (it is skipped and counted).
+    """
+    if not 1 <= limit <= 1_000_000:
+        raise ValueError("limit must be at least 1 and at most 1000000")
+    if not 1 <= max_depth <= 64:
+        raise ValueError("max_depth must be at least 1 and at most 64")
     if not root.exists():
         raise FileProblem(root, "folder does not exist.", cause="wrong path")
     if not root.is_dir():
@@ -227,18 +274,32 @@ def scan_directory(root: Path, pattern: str = "*", limit: int = 20000, max_depth
     gains, movies, seen = [], 0, 0
     unreadable: list[str] = []
     empty_files: list[str] = []
+    special: list[str] = []
+    outside_links: list[str] = []
+    deeper_dirs = 0
     base_depth = len(root.parts)
     truncated = False
 
     def onerror(err: OSError):
-        unreadable.append(f"{err.filename}: {err.strerror}")
+        where = display(Path(err.filename)) if err.filename else "?"
+        unreadable.append(f"{where}: {err.strerror}")
 
-    for dirpath, dirnames, filenames in os.walk(root, onerror=onerror):
-        if len(Path(dirpath).parts) - base_depth >= max_depth:
+    for dirpath, dirnames, filenames in os.walk(root, onerror=onerror):  # does not descend into symlinked folders
+        here = Path(dirpath)
+        for dn in dirnames:
+            dp = here / dn
+            if dp.is_symlink() and not is_allowed(dp.resolve()):
+                outside_links.append(str(dp.relative_to(root)))
+        if len(here.parts) - base_depth >= max_depth - 1:
+            deeper_dirs += len(dirnames)
             dirnames[:] = []
         for fn in filenames:
-            p = Path(dirpath) / fn
+            p = here / fn
             if not p.match(pattern):
+                continue
+            rel = str(p.relative_to(root))
+            if p.is_symlink() and not is_allowed(p.resolve()):
+                outside_links.append(rel)  # never stat or read the target
                 continue
             seen += 1
             if seen > limit:
@@ -249,9 +310,12 @@ def scan_directory(root: Path, pattern: str = "*", limit: int = 20000, max_depth
             try:
                 st = p.stat()
             except OSError as e:
-                unreadable.append(f"{p.relative_to(root)}: {e.strerror}")
+                unreadable.append(f"{rel}: {e.strerror}")
                 continue
-            rel = str(p.relative_to(root))
+            kind = special_kind(st.st_mode)
+            if kind:
+                special.append(f"{rel} ({kind})")
+                continue
             counts[ext] += 1
             sizes[ext] += st.st_size
             by_ext_files[ext].append((rel, st.st_size))
@@ -261,14 +325,23 @@ def scan_directory(root: Path, pattern: str = "*", limit: int = 20000, max_depth
                 newest = (st.st_mtime, rel)
             if "gain" in low or low.endswith((".gain", ".dm4")):
                 gains.append(rel)
-            elif p.suffix.lower() in MOVIE_EXTS and ("frame" in low or "movie" in low or p.suffix.lower() in (".tif", ".tiff", ".eer")):
+            elif _is_movie(p, low, st.st_size):
                 movies += 1
         if truncated:
             break
 
     problems = []
-    if seen == 0:
-        problems.append("folder is empty (or nothing matches the pattern)")
+    notes = []
+    scanned = min(seen, limit)
+    if scanned == 0:
+        if deeper_dirs:
+            problems.append(f"no files in the top {max_depth} folder levels, but {plural(deeper_dirs, 'deeper folder')} "
+                            f"{'was' if deeper_dirs == 1 else 'were'} not scanned; pass a larger max_depth")
+        else:
+            problems.append("folder is empty (or nothing matches the pattern)")
+    elif deeper_dirs:
+        problems.append(f"{plural(deeper_dirs, 'folder')} deeper than max_depth={max_depth} not scanned; "
+                        "pass a larger max_depth to include them")
     if empty_files:
         problems.append(f"{plural(len(empty_files), 'empty (0-byte) file')}, e.g. {', '.join(empty_files[:3])}: failed or in-progress copies")
     # same-type files much smaller than their siblings are usually incomplete copies
@@ -284,33 +357,47 @@ def scan_directory(root: Path, pattern: str = "*", limit: int = 20000, max_depth
         problems.append(f"{plural(len(suspicious), 'movie/image file')} less than half the typical size, possibly truncated: {ex}. "
                         "Check them with identify_file")
     # cheap header-vs-size check on MRC files (reads 1 KB each)
+    mrc_files = [rel for ext in (".mrc", ".mrcs") for rel, _ in by_ext_files.get(ext, [])]
     mrc_bad = []
-    for ext in (".mrc", ".mrcs"):
-        for rel, _ in by_ext_files.get(ext, [])[:500]:
-            try:
-                mrc_check(root / rel)
-            except FileProblem as e:
-                mrc_bad.append(e.problem)
-            except OSError:
-                pass
+    for rel in mrc_files[:MRC_HEADER_CHECKS]:
+        try:
+            mrc_check(root / rel)
+        except FileProblem as e:
+            mrc_bad.append(e.problem)
+        except OSError:
+            pass
     if mrc_bad:
         problems.append(f"{plural(len(mrc_bad), 'damaged MRC file')}; first: {mrc_bad[0]}")
+    if len(mrc_files) > MRC_HEADER_CHECKS:
+        notes.append(f"header-checked {MRC_HEADER_CHECKS} of {len(mrc_files)} MRC files; the rest were only checked "
+                     "by size. Scan subfolders separately (or use a pattern) to header-check them all")
     if movies and not gains:
         problems.append("movies found but no gain reference (no file with 'gain' in its name, .gain or .dm4)")
     if len(gains) > 1:
         problems.append(f"{plural(len(gains), 'gain reference')} found; make sure each session uses the right one")
     if unreadable:
         problems.append(f"{plural(len(unreadable), 'file/folder')} could not be read (permissions?), e.g. {unreadable[0]}")
+    if special:
+        problems.append(f"{plural(len(special), 'special file')} (pipes, devices or sockets) skipped without opening, "
+                        f"e.g. {special[0]}")
+    if outside_links:
+        notes.append(f"{plural(len(outside_links), 'symlink')} pointing outside the allowed folders skipped (not read), "
+                     f"e.g. {outside_links[0]}")
     if truncated:
-        problems.append(f"stopped after {limit} files; narrow the folder or pattern")
+        problems.append(f"stopped after {limit} files; narrow the folder or pattern, or raise limit")
 
-    return {
-        "folder": str(root),
-        "files_scanned": min(seen, limit),
+    out = {
+        "folder": display(root),
+        "files_scanned": scanned,
         "by_extension": {k: {"count": counts[k], "size": _size(sizes[k])} for k, _ in counts.most_common(12)},
         "likely_movies": movies,
         "gain_references_found": gains[:10],
         "newest_file": newest[1] or None,
         "newest_modified": time.strftime("%Y-%m-%d %H:%M", time.localtime(newest[0])) if newest[0] else None,
+        "mrc_headers_checked": f"{min(len(mrc_files), MRC_HEADER_CHECKS)} of {len(mrc_files)}",
+        "skipped": {"deeper_folders": deeper_dirs, "outside_symlinks": len(outside_links), "special_files": len(special)},
         "problems": problems,
     }
+    if notes:
+        out["notes"] = notes
+    return out

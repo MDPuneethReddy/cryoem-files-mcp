@@ -7,7 +7,7 @@ from pathlib import Path
 import mrcfile
 import numpy as np
 
-from .formats import FileProblem, Movie, data_warnings, read_2d, sample_stats
+from .formats import FORMAT_NAMES, FileProblem, Movie, data_warnings, read_2d, sample_stats
 from .paths import output_path
 
 # The 8 distinct ways a gain can be rotated/flipped relative to the movie.
@@ -37,7 +37,7 @@ def inspect_gain(path: Path) -> dict:
     mean = float(good.mean()) if good.size else float("nan")
     result = {
         "file": path.name,
-        "format": fmt,
+        "format": FORMAT_NAMES[fmt],
         "shape_yx": list(g.shape),
         "stats": sample_stats(g),
         "zero_or_defect_pixels_pct": round(100 * zero.mean(), 4),
@@ -78,6 +78,13 @@ def _highpass(a: np.ndarray, r: int = 8) -> np.ndarray:
     return a - blur
 
 
+def _detrend_lines(a: np.ndarray) -> np.ndarray:
+    """Remove per-row and per-column offsets. Readout stripes are shared by many detectors; left in, they make
+    unrelated gains correlate (few independent values), which would break the z = |r| * sqrt(n) null model."""
+    a = a - a.mean(axis=0, keepdims=True)
+    return a - a.mean(axis=1, keepdims=True)
+
+
 def _center_crop(a: np.ndarray, size: int) -> np.ndarray:
     h, w = a.shape
     ch, cw = min(size, h), min(size, w)
@@ -85,15 +92,34 @@ def _center_crop(a: np.ndarray, size: int) -> np.ndarray:
     return a[y0 : y0 + ch, x0 : x0 + cw]
 
 
+# Orientation scoring is a significance test. For a gain that has nothing to do with the movie, the Pearson
+# correlation r over n independent pixels is ~ N(0, 1/sqrt(n)), so z = |r| * sqrt(n) is ~ |N(0, 1)|.
+# The best of 8 variants exceeds 6 by chance with probability ~ 8 * 2e-9; real data (residual structure,
+# shared defect rows) is less ideal than that, hence the margin. Calibration: scripts/calibrate_orientation.py.
+Z_MATCH = 6.0  # below this the best variant is indistinguishable from chance: no match
+Z_HIGH = 10.0  # best variant at least this significant ...
+GAP_HIGH = 6.0  # ... and this far (in z units) ahead of the runner-up -> high confidence
+GAP_MEDIUM = 3.0  # below this the top two variants cannot be told apart -> low (ambiguous)
+
+
+def _robust_clip(a: np.ndarray, k: float = 5.0) -> np.ndarray:
+    """Clip outliers (hot/dead pixels) to k robust standard deviations so a few pixels cannot dominate r."""
+    lo, med, hi = np.percentile(a, [15.87, 50, 84.13])
+    sd = (hi - lo) / 2
+    if not np.isfinite(sd) or sd <= 0:
+        return a
+    return np.clip(a, med - k * sd, med + k * sd)
+
+
 def check_orientation(gain_path: Path, movie_path: Path, n_frames: int = 20, crop: int = 2048) -> dict:
     """Score all 8 rotate/flip variants of the gain against the summed raw movie frames.
 
     Raw (not gain-normalised) frames carry the detector's fixed pixel pattern. The right variant
     correlates strongly with it (negative for multiplicative gains, positive for divisive ones);
-    wrong variants correlate near zero.
+    wrong variants, and gains from another detector, correlate only at chance level.
     """
-    if n_frames < 1:
-        raise ValueError("n_frames must be at least 1")
+    if not 1 <= n_frames <= 10_000:
+        raise ValueError("n_frames must be at least 1 and at most 10000")
     g, _ = read_2d(gain_path)
     bad = data_warnings(g, "gain")
     if any("every" in b or "same value" in b for b in bad):
@@ -129,11 +155,17 @@ def check_orientation(gain_path: Path, movie_path: Path, n_frames: int = 20, cro
         a = _center_crop(mv_sum, crop)
         b = _center_crop(t, crop)
         mask = np.isfinite(b) & (b > 0)
-        ha, hb = _highpass(a)[mask], _highpass(np.where(mask, b, np.nanmean(b[mask])))[mask]
+        n = int(mask.sum())
+        if n < 16:
+            results.append({"variant": variant_name(k, flip), "r": None, "skipped": "too few valid gain pixels"})
+            continue
+        ha = _robust_clip(_detrend_lines(_highpass(a))[mask])
+        hb = _robust_clip(_detrend_lines(_highpass(np.where(mask, b, np.nanmean(b[mask]))))[mask])
         ha, hb = ha - ha.mean(), hb - hb.mean()
         denom = np.sqrt((ha**2).sum() * (hb**2).sum())
         r = float((ha * hb).sum() / denom) if denom > 0 else 0.0
-        results.append({"variant": variant_name(k, flip), "rot90_ccw": k, "flip_y": flip, "r": round(r, 4)})
+        results.append({"variant": variant_name(k, flip), "rot90_ccw": k, "flip_y": flip, "r": round(r, 4),
+                        "z": round(abs(r) * np.sqrt(n), 1), "n": n})
 
     scored = [x for x in results if x.get("r") is not None]
     if not scored:
@@ -144,36 +176,69 @@ def check_orientation(gain_path: Path, movie_path: Path, n_frames: int = 20, cro
             cause="the gain belongs to a different detector, mode (counting vs super-resolution) or session",
             fix="use the gain reference recorded with this session",
         )
-    scored.sort(key=lambda x: abs(x["r"]), reverse=True)
+    scored.sort(key=lambda x: x["z"], reverse=True)
     best, runner = scored[0], (scored[1] if len(scored) > 1 else None)
-    margin = abs(best["r"]) - (abs(runner["r"]) if runner else 0.0)
-    ratio = abs(best["r"]) / max(abs(runner["r"]), 1e-6) if runner else float("inf")
-    confidence = "high" if (abs(best["r"]) > 0.1 and ratio > 3) else "medium" if ratio > 1.5 else "low"
-    convention = "multiply (raw x gain)" if best["r"] < 0 else "divide (raw / gain)"
-    out = {
-        "best": best["variant"],
-        "rot90_ccw": best["rot90_ccw"],
-        "flip_y": best["flip_y"],
-        "correlation": best["r"],
-        "runner_up": runner and {"variant": runner["variant"], "r": runner["r"]},
-        "confidence": confidence,
-        "margin": round(margin, 4),
-        "gain_convention": convention,
+    z_best = best["z"]
+    z_runner = runner["z"] if runner else 0.0
+    gap = round(z_best - z_runner, 1)
+    if z_best < Z_MATCH:
+        confidence = "no_match"
+    elif gap < GAP_MEDIUM:
+        confidence = "low"
+    elif z_best >= Z_HIGH and gap >= GAP_HIGH:
+        confidence = "high"
+    else:
+        confidence = "medium"
+    out: dict = {"confidence": confidence}
+    if confidence != "no_match":
+        out.update({"best": best["variant"], "rot90_ccw": best["rot90_ccw"], "flip_y": best["flip_y"],
+                    "correlation": best["r"]})
+    out.update({
+        "z_best": z_best,
+        "z_runner_up": z_runner,
+        "z_gap": gap,
+        "runner_up": runner and {"variant": runner["variant"], "r": runner["r"], "z": runner["z"]},
+        "pixels_compared": best["n"],
         "frames_summed": used,
-        "all_variants": {x["variant"]: x.get("r") for x in results},
-        "next_step": (
-            f"convert_gain with rotate={best['rot90_ccw']}, flip='{'y' if best['flip_y'] else 'none'}'"
-            + (", invert=true" if best["r"] > 0 else "")
-            + " writes a multiplicative MRC gain already matched to the movie; then run MotionCor with "
-            "-RotGain 0 -FlipGain 0 (and no -InvGain)."
-        ),
-    }
+        "all_variants": {x["variant"]: ({"r": x["r"], "z": x["z"]} if x.get("r") is not None else x.get("skipped"))
+                         for x in results},
+        "thresholds": f"no_match if z_best < {Z_MATCH:g}; high if z_best >= {Z_HIGH:g} and z_gap >= {GAP_HIGH:g}; "
+                      f"low if z_gap < {GAP_MEDIUM:g}; otherwise medium (z = |r| * sqrt(pixels compared))",
+    })
+    if confidence == "no_match":
+        hint = (" The movie frames are float, so they are probably already gain-normalised; use the raw movies."
+                if note else "")
+        out["problem"] = str(FileProblem(
+            gain_path,
+            f"does not match this movie in any orientation: the best variant ({best['variant']}) scores z={z_best:g}, "
+            f"below {Z_MATCH:g}, which is what an unrelated gain gives by chance.{hint}",
+            cause="the gain belongs to a different detector or session, or the movie is already gain-normalised",
+            fix="find the gain reference recorded with these movies (same session folder), and check against a raw, "
+                "integer-count movie; with very low dose, raise n_frames",
+        ))
+    else:
+        convention = "multiply (raw x gain)" if best["r"] < 0 else "divide (raw / gain)"
+        out["gain_convention"] = convention
+        step = (f"convert_gain with rotate={best['rot90_ccw']}, flip='{'y' if best['flip_y'] else 'none'}'"
+                + (", invert=true" if best["r"] > 0 else "")
+                + " writes a multiplicative MRC gain already matched to the movie; then run MotionCor with "
+                  "-RotGain 0 -FlipGain 0 (and no -InvGain).")
+        if confidence == "high":
+            out["next_step"] = step
+        elif confidence == "medium":
+            out["next_step"] = "Probably: " + step
+            out["warning"] = (f"The match is real (z={z_best:g}) but {best['variant']} is only {gap:g} z ahead of "
+                              f"{runner['variant'] if runner else 'the next variant'}. Re-run with more frames "
+                              "(n_frames=50+) to confirm before converting.")
+        else:
+            out["warning"] = (f"The gain matches the movie (z={z_best:g}) but {best['variant']} and "
+                              f"{runner['variant'] if runner else '?'} score almost the same (gap {gap:g}), so the "
+                              "orientation cannot be decided. Use more frames (n_frames=50+) or another raw movie; "
+                              "do not guess an orientation.")
     if scaling:
         out["scaling"] = scaling
     if note:
         out["note"] = note
-    if confidence == "low":
-        out["warning"] = "No variant stands out. Use raw (non-gain-normalised) frames and more frames (n_frames=50+)."
     return out
 
 
@@ -187,7 +252,7 @@ def convert_gain(
     pixel_size: float | None = None,
     overwrite: bool = False,
 ) -> dict:
-    """Write the gain as a float32 MRC, applying rotate (ccw, x90) then flip, optional inversion and binning."""
+    """Write the gain as a float32 MRC, applying rotate (ccw, x90), then flip, then 2x binning, then inversion."""
     if rotate not in (0, 1, 2, 3):
         raise ValueError("rotate must be 0, 1, 2 or 3 (multiples of 90 degrees counter-clockwise)")
     if flip not in ("none", "y", "x"):
@@ -205,15 +270,17 @@ def convert_gain(
     elif flip == "x":
         g = np.fliplr(g)
         applied.append("flipped left-right")
+    # bin before inverting: a divisive gain describes counts, so 2x2 pixels add up in the gain's own convention;
+    # inverting first would turn one defect pixel into a large error in its whole binned pixel (QA M2)
+    if bin == 2:
+        g = bin2(g)
+        applied.append("binned 2x (mean)")
     if invert:
         safe = np.isfinite(g) & (g != 0)
         inv = np.zeros_like(g, dtype=np.float32)
         inv[safe] = 1.0 / g[safe]
         g = inv
         applied.append("inverted (1/gain; zero/defect pixels stay 0)")
-    if bin == 2:
-        g = bin2(g)
-        applied.append("binned 2x (mean)")
     g = np.ascontiguousarray(g, dtype=np.float32)
 
     for w in data_warnings(g, "gain"):
@@ -238,7 +305,7 @@ def convert_gain(
                           cause="no write permission or the disk is full", fix="pass out= pointing to a writable folder with free space") from None
     return {
         "output": str(dst),
-        "input_format": fmt,
+        "input_format": FORMAT_NAMES[fmt],
         "shape_yx": list(g.shape),
         "applied": applied or ["no transform (format conversion only)"],
         "stats": sample_stats(g),

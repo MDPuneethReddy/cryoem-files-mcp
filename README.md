@@ -14,11 +14,11 @@ Runs locally over stdio. Nothing is uploaded; there is no server to host.
 | `inspect_mrc` | Header, pixel size, stats, MRC2014 validation | No |
 | `inspect_movie` | Frames, size, compression, counts/pixel/frame, gain-normalised guess (TIFF, EER, MRC) | No |
 | `inspect_gain` | Size, value range, defect pixels, convention hints | No |
-| `check_gain_orientation` | Scores all 8 rotations/flips of the gain against raw frames; reports best match and multiply-vs-divide convention | No |
-| `convert_gain` | Float32 MRC gain with rotate/flip/invert/2x-bin baked in | New file only |
+| `check_gain_orientation` | Scores all 8 rotations/flips of the gain against raw frames; reports the best match with a significance-based confidence (`high`, `medium`, `low`, `no_match`) and the multiply-vs-divide convention | No |
+| `convert_gain` | Float32 MRC gain with rotate/flip/2x-bin/invert baked in (applied in that order) | New file only |
 | `summarize_star` | RELION STAR blocks, optics groups, defocus/CTF/class stats | No |
 | `parse_mdoc` | SerialEM tilt range, step, dose, pixel size | No |
-| `scan_directory` | File counts by type, gain references found, obvious problems | No |
+| `scan_directory` | File counts by type, gain references found, obvious problems. `max_depth` (default 8 folder levels), `limit` (default 20,000 files); reports what it skipped | No |
 
 Also: resource `cryoem://formats` (gain conventions cheat sheet) and prompts `diagnose_dataset`, `prepare_for`.
 
@@ -55,7 +55,9 @@ Claude Desktop (`claude_desktop_config.json`):
 }
 ```
 
-`--root` (repeatable, or `CRYOEM_MCP_ROOTS`) limits which folders the tools can read. Default: the current directory.
+`--root` (repeatable, or `CRYOEM_MCP_ROOTS`) limits which folders the tools can read. Default: the current directory. The server refuses to start (exit code 2, reason on stderr) if a root does not exist or is not a folder.
+
+`--timeout` (or `CRYOEM_MCP_TIMEOUT`, default 300 seconds) is the longest a single tool call may run before it returns an error.
 
 ## Damaged files
 
@@ -63,7 +65,18 @@ Every reader checks the file before trusting the library, because the libraries 
 
 ## How the orientation check works
 
-Raw (not gain-normalised) frames carry the detector's fixed pixel pattern. The tool sums N frames, high-pass filters both the sum and each of the 8 rotated/flipped gains, and correlates them. The right variant correlates strongly; the rest sit near zero. A negative correlation means a multiplicative gain (K2/K3, Falcon TIFF `.gain`); a positive one means divisive (older Falcon MRC gains for EER).
+Raw (not gain-normalised) frames carry the detector's fixed pixel pattern. The tool sums N frames, high-pass filters both the sum and each of the 8 rotated/flipped gains (also removing row/column offsets and clipping hot pixels), and correlates them. The right variant correlates strongly; the rest sit near zero. A negative correlation means a multiplicative gain (K2/K3, Falcon TIFF `.gain`); a positive one means divisive (older Falcon MRC gains for EER).
+
+Confidence is a significance test, not a fixed correlation cut-off. For a gain that does not belong to the movie, the correlation r over n compared pixels is about N(0, 1/sqrt(n)), so the tool reports z = |r| x sqrt(n) for every variant:
+
+| Verdict | Rule | What to do |
+| --- | --- | --- |
+| `no_match` | best z < 6 | The gain does not belong to these movies (or the movie is already gain-normalised). No orientation is suggested. |
+| `low` | z gap to the runner-up < 3 | The gain matches, but two variants tie. Use more frames or another raw movie. |
+| `medium` | otherwise | Probably right; confirm with more frames before converting. |
+| `high` | best z >= 10 and gap >= 6 | Convert as suggested. |
+
+Calibration on simulated data (`python3 scripts/calibrate_orientation.py --full`): 120 unrelated same-size gains gave best z of at most 3.1 (all `no_match`; 50 more with strong shared row/column stripes, at most 3.0); correct gains with 2% and 1% pixel variation at 0.5 e/px/frame, 20 frames, 512x512 gave z of about 32 and 16 (all `high`); a Falcon-style 8K gain with 4% variation against a 4K movie gave z = 88 (`high`).
 
 `convert_gain` can then bake the winning orientation (and the inversion, if needed) into a new MRC, so MotionCor runs with `-RotGain 0 -FlipGain 0` and no `-InvGain`.
 
@@ -71,11 +84,13 @@ Raw (not gain-normalised) frames carry the detector's fixed pixel pattern. The t
 
 - Read tools never modify files.
 - `convert_gain` writes a new file and refuses to overwrite anything (including its input) unless `overwrite=true`.
-- Paths outside the allowed roots are refused.
+- Paths outside the allowed roots are refused, including through symlinks; error messages show the path as given, never where a symlink points. `scan_directory` skips (and counts) symlinks that lead outside the roots without reading them.
+- Named pipes, devices and sockets are never opened (reading them can block forever); `scan_directory` skips and counts them.
+- Stale network mounts: a read on a hung NFS/GPFS mount blocks inside the kernel and cannot be interrupted. The call returns a timeout error after `--timeout` seconds and the server stays usable, but the stuck worker thread remains until the mount recovers. Check the mount (`ls` the folder in a terminal) if calls time out.
 
 ## Status and known limits (v0.1)
 
-- 65 tests on synthetic data: all 8 orientations, both conventions, 4K/8K binning, and ~45 damaged or unusual files. Needs validation on real K3 and Falcon 4 datasets from EMPIAR.
+- 91 tests on synthetic data: all 8 orientations, both conventions, 4K/8K binning, and ~45 damaged or unusual files. Needs validation on real K3 and Falcon 4 datasets from EMPIAR.
 - `.dm4` reading uses `ncempy` and is untested on real Gatan gains; compare against IMOD `dm2mrc` before trusting it.
 - Assumes MotionCor reads TIFF/EER movies and MRC gains in the same row order as `tifffile`/`mrcfile`. Confirm once on a real dataset.
 

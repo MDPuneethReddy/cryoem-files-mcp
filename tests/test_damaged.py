@@ -236,12 +236,14 @@ def test_blank_movie_for_orientation(tmp_path):
     assert "frames are blank" in err(check_orientation, tmp_path / "g.gain", tmp_path / "blank.tif")
 
 
-def test_gain_normalised_movie_gives_low_confidence(tmp_path):
+def test_gain_normalised_movie_gives_no_match(tmp_path):
+    # behaviour changed in 0.1.1 (QA H2): no significant correlation is reported as no_match, without a recommendation
     g = make_gain((128, 128))
     tifffile.imwrite(tmp_path / "g.gain", g)
     tifffile.imwrite(tmp_path / "norm.tif", RNG.poisson(3, (10, 128, 128)).astype(np.float32))
     r = check_orientation(tmp_path / "g.gain", tmp_path / "norm.tif")
-    assert r["confidence"] == "low" and "warning" in r and "note" in r
+    assert r["confidence"] == "no_match" and "does not match" in r["problem"] and "note" in r
+    assert "next_step" not in r and "best" not in r
 
 
 def test_complex_mrc_as_gain(tmp_path):

@@ -6,7 +6,7 @@ It catches the silent problems that waste processing time: truncated or half-cop
 
 ## What it runs
 
-When enabled, Claude Code starts the open-source `cryoem-files-mcp` Python package (pinned version, installed from PyPI with `uvx`) as a local MCP server. It runs only on your machine, reads only the data folder you choose at setup, makes no network requests and sends no data anywhere. The only tool that writes is `convert_gain`, which creates a new MRC file next to the input and never overwrites anything unless asked.
+When enabled, Claude Code starts the open-source `cryoem-files-mcp` Python package (pinned version, installed from PyPI with `uvx`) as a local MCP server. It runs only on your machine and reads only the data folder you choose at setup. The server makes no network requests and sends no data anywhere. On first run, `uvx` downloads the pinned package and its dependencies from PyPI. The only tool that writes is `convert_gain`, which creates a new MRC file next to the input and never overwrites anything unless asked.
 
 ## Install
 

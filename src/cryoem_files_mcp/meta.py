@@ -62,6 +62,15 @@ def _text(path: Path, what: str) -> str:
     return text
 
 
+# STAR values may be quoted ('my mic 1.mrc' or "a b"); a quote only opens at the start of a value and only
+# closes when followed by whitespace or the end of the line, so quotes inside a value (it's) are kept.
+_STAR_TOKEN = re.compile(r"""'.*?'(?=\s|$)|".*?"(?=\s|$)|\S+""")
+
+
+def _split_row(line: str) -> list[str]:
+    return _STAR_TOKEN.findall(line)
+
+
 def _loop_row_problems(text: str) -> list[str]:
     """Find data rows whose field count differs from the loop's column count (pandas silently pads short rows)."""
     problems = []
@@ -84,7 +93,7 @@ def _loop_row_problems(text: str) -> list[str]:
             continue
         if in_loop and cols:
             data_started = True
-            n = len(s.split())
+            n = len(_split_row(s))
             if n != cols:
                 problems.append(f"{block} line {ln}: {n} values but {cols} columns")
                 if len(problems) >= 5:
@@ -159,7 +168,9 @@ def summarize_star(path: Path) -> dict:
             if null_rows and not row_problems:
                 problems.append(f"block '{label}': {plural(null_rows, 'row')} with empty values")
         out["blocks"][label] = info
-    if "optics" not in blocks and any(k for k in blocks):
+    image_star = any(hasattr(df, "columns") and ({"rlnMicrographName", "rlnImageName"} & set(df.columns))
+                     for df in blocks.values())
+    if "optics" not in blocks and image_star:
         out["notes"] = ["no optics block: a RELION 3.0-style file; RELION 3.1+ expects one"]
     if problems:
         out["problems"] = problems

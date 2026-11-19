@@ -82,7 +82,7 @@ def test_tiff_is_not_mistaken_for_mrc(tmp_path):
     g = make_gain(shape=(32, 32))
     tifffile.imwrite(tmp_path / "a.gain", g)
     info = inspect_gain(tmp_path / "a.gain")
-    assert info["format"] == "tiff"  # Magellon's is_mrc() said MRC
+    assert info["format"] == "TIFF"  # Magellon's is_mrc() said MRC (display names since 0.1.1, QA L7)
     assert info["zero_or_defect_pixels_pct"] > 0
 
 

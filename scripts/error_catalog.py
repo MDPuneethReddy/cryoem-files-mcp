@@ -15,7 +15,7 @@ from tests.test_damaged import STAR_HEAD, corrupt_frame, cut, good_movie_tif, go
 from cryoem_files_mcp.gain import check_orientation, convert_gain, inspect_gain  # noqa: E402
 from cryoem_files_mcp.inspect import identify_file, inspect_movie, inspect_mrc, scan_directory  # noqa: E402
 from cryoem_files_mcp.meta import parse_mdoc, summarize_star  # noqa: E402
-from cryoem_files_mcp.paths import set_roots  # noqa: E402
+from cryoem_files_mcp.paths import resolve, set_roots  # noqa: E402
 import struct  # noqa: E402
 
 d = Path(tempfile.mkdtemp())
@@ -26,7 +26,7 @@ rows = []
 def case(title, fn, *a, **k):
     try:
         r = fn(*a, **k)
-        msg = "; ".join(r.get("problems", [])) or "(no problems reported)"
+        msg = "; ".join(r.get("problems", []) + [r[k] for k in ("problem", "warning") if k in r]) or "(no problems reported)"
         kind = "reported"
     except Exception as e:
         msg, kind = str(e), "error"
@@ -82,6 +82,20 @@ for i in range(6):
 cut(s / "movie_5.tif", 0.2); (s / "movie_6.tif").write_bytes(b"")
 case("Session folder with incomplete copies", scan_directory, s)
 case("Folder passed as a file", inspect_mrc, s)
+case("Missing file", resolve, "session/missing.mrc")
+os.symlink("/etc/hostname", d / "outside.mrc")
+case("Symlink pointing outside the allowed folders", resolve, "outside.mrc")
+if hasattr(os, "mkfifo"):
+    os.mkfifo(d / "pipe.mrc")
+    case("Named pipe (FIFO) named .mrc", inspect_mrc, d / "pipe.mrc")
+    os.mkfifo(s / "pipe.tif")
+deep = s / "a" / "b" / "c"; deep.mkdir(parents=True); good_movie_tif(deep / "movie_deep.tif")
+case("Session folder with a pipe and deeper folders (max_depth=2)", scan_directory, s, max_depth=2)
+rng = np.random.default_rng(0)
+tifffile.imwrite(d / "raw.tif", rng.poisson(3, (20, 256, 256)).astype(np.uint8))
+tifffile.imwrite(d / "other.gain", make_gain((256, 256), seed=9))
+case("Gain that does not belong to the movie (orientation)", check_orientation, d / "other.gain", d / "raw.tif")
+case("Invalid scan limit", scan_directory, s, limit=-5)
 
 out = Path(__file__).resolve().parents[1] / "docs" / "error-messages.md"
 lines = ["# Error messages for damaged files", "",

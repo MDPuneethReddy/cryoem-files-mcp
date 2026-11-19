@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import io
 import logging
+import os
+import stat
 import warnings
 from contextlib import contextmanager
 from pathlib import Path
@@ -69,13 +71,49 @@ def plural(n: int, word: str) -> str:
 
 # ---------------------------------------------------------------- basic checks and detection
 
-def check_basic(path: Path) -> int:
-    if path.is_dir():
-        raise FileProblem(path, "is a folder, not a file.", fix="pass a file path, or use scan_directory for folders")
-    if not path.exists():
-        raise FileProblem(path, "does not exist.", cause="wrong path or the file was moved")
+_SPECIAL_KINDS = (
+    (stat.S_ISFIFO, "named pipe (FIFO)"),
+    (stat.S_ISCHR, "character device"),
+    (stat.S_ISBLK, "block device"),
+    (stat.S_ISSOCK, "socket"),
+)
+
+
+def special_kind(mode: int) -> str | None:
+    """Name of a non-regular, non-folder file type (pipe, device, socket), or None for a regular file/folder."""
+    if stat.S_ISREG(mode) or stat.S_ISDIR(mode):
+        return None
+    return next((name for test, name in _SPECIAL_KINDS if test(mode)), "special file")
+
+
+def regular_stat(path: Path) -> os.stat_result:
+    """stat() a path and refuse anything that is not a regular file, without ever opening it.
+
+    Opening a named pipe blocks until a writer appears and reading a device never ends, so the
+    type is checked with stat (which does not open the file) before any read.
+    """
     try:
-        size = path.stat().st_size
+        st = os.stat(path)
+    except FileNotFoundError:
+        raise FileProblem(path, "does not exist.", cause="wrong path, or the file was moved or deleted",
+                          fix="check the name; relative paths start at the allowed folder") from None
+    except PermissionError:
+        raise FileProblem(path, "cannot be read: permission denied.", fix="check the file's permissions (ls -l)") from None
+    except OSError as e:
+        raise FileProblem(path, f"cannot be read: {e.strerror or e}.", cause="storage or network filesystem error") from None
+    if stat.S_ISDIR(st.st_mode):
+        raise FileProblem(path, "is a folder, not a file.", fix="pass a file path, or use scan_directory for folders")
+    kind = special_kind(st.st_mode)
+    if kind:
+        raise FileProblem(path, f"is a {kind}, not a regular file, so it was not opened.",
+                          cause="reading a pipe or device can block forever; it is not a data file",
+                          fix="pass a regular data file")
+    return st
+
+
+def check_basic(path: Path) -> int:
+    size = regular_stat(path).st_size
+    try:
         with open(path, "rb") as f:
             f.read(1)
     except PermissionError:
