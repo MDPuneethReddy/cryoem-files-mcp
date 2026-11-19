@@ -24,9 +24,18 @@
     "data_folder": {
       "type": "directory",
       "title": "Cryo-EM data folder",
-      "description": "Top folder holding your sessions. The tools can only read files inside it.",
+      "description": "Top folder holding your sessions. The tools can only read files inside it. Pick your data folder, not your home folder.",
       "required": true
     }
   },
-  "icon": "./.claude-plugin/icon.png"
+  "icon": "./.claude-plugin/icon.png",
+  "network": {
+    "hosts": [
+      "pypi.org",
+      "files.pythonhosted.org",
+      "releases.astral.sh",
+      "github.com",
+      "release-assets.githubusercontent.com"
+    ]
+  }
 }

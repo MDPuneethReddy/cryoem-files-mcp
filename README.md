@@ -24,22 +24,28 @@ Also: resource `cryoem://formats` (gain conventions cheat sheet) and prompts `di
 
 ## Install
 
-Easiest, as a Claude Code plugin (asks for your data folder, adds a file-checking skill):
+Requires [uv](https://docs.astral.sh/uv/) (provides `uvx`) for the plugin and the configs below. The first run downloads the package from PyPI; after that it runs offline.
+
+Easiest, as a Claude Code plugin (asks for your data folder, adds a file-checking skill). Add the marketplace, then install:
 
 ```
-/plugin install cryoem-files --marketplace MDPuneethReddy/cryoem-files-mcp
+/plugin marketplace add MDPuneethReddy/cryoem-files-mcp
+/plugin install cryoem-files@cryoem-files-mcp
 ```
+
+On Claude Code v2.1.275 or later, one step also works: `/plugin install cryoem-files --marketplace MDPuneethReddy/cryoem-files-mcp`. The plugin targets Claude Code: Claude Cowork does not prompt for the data folder, and Claude chat does not run local servers.
 
 Or the package directly:
 
 ```bash
 pip install cryoem-files-mcp            # add [dm4] for Gatan .dm4 gains
+cryoem-files-mcp --root /data/cryoem    # --root is required
 ```
 
 Claude Code (without the plugin):
 
 ```bash
-claude mcp add cryoem-files -- uvx cryoem-files-mcp --root /data/cryoem
+claude mcp add cryoem-files -- uvx cryoem-files-mcp==0.1.0 --root /data/cryoem
 ```
 
 Claude Desktop (`claude_desktop_config.json`):
@@ -49,13 +55,15 @@ Claude Desktop (`claude_desktop_config.json`):
   "mcpServers": {
     "cryoem-files": {
       "command": "uvx",
-      "args": ["cryoem-files-mcp", "--root", "/data/cryoem"]
+      "args": ["cryoem-files-mcp==0.1.0", "--root", "/data/cryoem"]
     }
   }
 }
 ```
 
-`--root` (repeatable, or `CRYOEM_MCP_ROOTS`) sets which folders the tools can read. It is required: the server does not fall back to the current directory, because MCP clients often start servers in `/` or your home folder. The server refuses to start (exit code 2, reason on stderr) if no root is given, or a root does not exist or is not a folder.
+Replace `/data/cryoem` with the folder that holds your data (not your home folder). Add more folders with more `--root` arguments.
+
+`--root` (repeatable; or `CRYOEM_MCP_ROOTS`, folders separated by `:`, or `;` on Windows, used only when no `--root` is given) sets which folders the tools can read. It is required: the server does not fall back to the current directory, because MCP clients often start servers in `/` or your home folder. The server refuses to start (exit code 2, reason on stderr) if no root is given, or a root does not exist or is not a folder.
 
 `--timeout` (or `CRYOEM_MCP_TIMEOUT`, default 300 seconds) is the longest a single tool call may run before it returns an error.
 

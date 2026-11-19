@@ -20,9 +20,26 @@
         {
           "type": "named",
           "name": "--root",
-          "description": "Folder the tools may read (repeatable). Defaults to the current directory.",
+          "description": "Folder the tools may read. Required: the server will not start without it. Repeat for several folders.",
+          "isRequired": true,
+          "isRepeated": true,
+          "format": "filepath",
+          "placeholder": "/data/cryoem"
+        }
+      ],
+      "environmentVariables": [
+        {
+          "name": "CRYOEM_MCP_ROOTS",
+          "description": "Alternative to --root: allowed folders separated by ':' (';' on Windows). Ignored when --root is given.",
           "isRequired": false,
           "format": "string"
+        },
+        {
+          "name": "CRYOEM_MCP_TIMEOUT",
+          "description": "Seconds before a single tool call is abandoned with an error (default 300). --timeout overrides it.",
+          "isRequired": false,
+          "format": "number",
+          "default": "300"
         }
       ]
     }
