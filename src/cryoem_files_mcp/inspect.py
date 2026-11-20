@@ -303,6 +303,8 @@ def scan_directory(root: Path, pattern: str = "*", limit: int = 20000, max_depth
 
     for dirpath, dirnames, filenames in os.walk(root, onerror=onerror):  # does not descend into symlinked folders
         here = Path(dirpath)
+        dirnames.sort()  # deterministic order on every filesystem (also decides which files fall under the caps)
+        filenames.sort()
         for dn in dirnames:
             dp = here / dn
             if dp.is_symlink() and not is_allowed(dp.resolve()):
