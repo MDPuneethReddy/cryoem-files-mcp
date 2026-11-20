@@ -1261,8 +1261,8 @@ def test_L7_format_name_consistent(root):
 # ============================================================================ PM-8
 
 def test_PM8_pandas_declared_dependency():
-    import tomllib
+    # tomllib is Python 3.11+; read the installed distribution's metadata instead (works on 3.10)
+    from importlib.metadata import requires
 
-    py = Path(__file__).resolve().parents[1] / "pyproject.toml"
-    deps = tomllib.loads(py.read_text())["project"]["dependencies"]
+    deps = requires("cryoem-files-mcp") or []
     assert any(re.match(r"pandas\b", d) for d in deps), deps
