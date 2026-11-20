@@ -123,7 +123,7 @@ def _mrc_role(name: str, shape: tuple) -> str:
     nz, ny, nx = shape[0], shape[1], shape[2]
     if name.endswith(".mrcs"):  # the extension is explicit, even when the particle count equals the box size
         return "particle stack"
-    if nz == ny == nx:
+    if nz == ny == nx or name.endswith((".map", ".ccp4", ".rec")) or name.startswith("emd-"):
         return "3D map/volume"
     if nz > 50 and ny == nx and ny <= 512:
         return "particle stack"

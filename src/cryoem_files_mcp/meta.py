@@ -235,9 +235,7 @@ def summarize_star(path: Path) -> dict:
             if "rlnOpticsGroup" in df.columns:
                 info["optics_group_counts"] = {str(k): int(v) for k, v in df["rlnOpticsGroup"].value_counts().items()}
             info["column_names"] = [c for c in df.columns if c not in KEY_COLUMNS][:20]
-            null_rows = int(df.isna().any(axis=1).sum())
-            if null_rows and not row_problems:
-                problems.append(f"block '{label}': {plural(null_rows, 'row')} with empty values")
+            # empty values ("") are legal STAR; real damage is caught as rows with the wrong number of values
         out["blocks"][label] = info
     image_star = any(hasattr(df, "columns") and ({"rlnMicrographName", "rlnImageName"} & set(df.columns))
                      for df in blocks.values())
@@ -274,6 +272,16 @@ def parse_mdoc(path: Path) -> dict:
     if odd:
         problems.append(f"{plural(len(odd), 'line')} not in 'key = value' form {'was' if len(odd) == 1 else 'were'} ignored ({'; '.join(odd[:3])}): "
                         "the file may be damaged or hand-edited")
+    # What kind of acquisition is this? Montages (grid/square atlases) and SerialEM frame-set files repeat the
+    # same tilt by design and often have no dose calibration, so tilt-series checks must not run on them.
+    is_montage = bool(re.search(r"^\s*Montage\s*=\s*1\b", text, re.M)) or "PieceCoordinates" in df.columns
+    has_frame_sets = "[FrameSet" in text
+    tilts_all = np.asarray(df["TiltAngle"], dtype=float) if "TiltAngle" in df.columns else np.array([])
+    finite_tilts = tilts_all[np.isfinite(tilts_all)]
+    span = float(finite_tilts.max() - finite_tilts.min()) if finite_tilts.size else 0.0
+    is_tilt_series = (not is_montage) and span >= 5.0
+    out["acquisition"] = ("montage" if is_montage else "tilt series" if is_tilt_series
+                          else "frame sets" if has_frame_sets else "single tilt / images")
     if "TiltAngle" in df.columns:
         t = np.asarray(df["TiltAngle"], dtype=float)
         missing = int((~np.isfinite(t)).sum())
@@ -287,16 +295,21 @@ def parse_mdoc(path: Path) -> dict:
             out["tilt_step_deg"] = _r(np.median(steps)) if steps.size else None
             out["acquisition_order_first5"] = [_r(x) for x in t[:5]]
             dup = int(len(t) - len(np.unique(np.round(t, 2))))
-            if dup:
+            if dup and is_tilt_series:
                 problems.append(f"{plural(dup, 'duplicate tilt angle')} (repeated or failed exposures?)")
-    else:
+            if not is_tilt_series:
+                out.pop("tilt_step_deg", None)
+    elif not is_montage:
         problems.append("no TiltAngle entries: not a tilt series, or the mdoc is incomplete")
+    if is_montage:
+        out["montage_pieces"] = int(len(df))
     if "ExposureDose" in df.columns:
         d = np.asarray(df["ExposureDose"], dtype=float)
         out["total_dose_e_per_A2"] = _r(np.nansum(d))
         out["dose_per_tilt"] = _r(np.nanmedian(d))
-        if np.nanmax(d) == 0:
-            problems.append("ExposureDose is 0 for every section: dose was not calibrated, so dose weighting will be wrong")
+        if np.nanmax(d) == 0 and is_tilt_series:
+            problems.append("ExposureDose is 0 for every tilt: dose was not calibrated in SerialEM, so dose weighting "
+                            "needs the dose entered by hand")
     for col, key in (("PixelSpacing", "pixel_size_A"), ("NumSubFrames", "frames_per_tilt"), ("ExposureTime", "exposure_s"),
                      ("Magnification", "magnification"), ("Defocus", "defocus_um")):
         if col in df.columns:
@@ -304,6 +317,10 @@ def parse_mdoc(path: Path) -> dict:
             v = v[np.isfinite(v)]
             if v.size:
                 out[key] = _r(np.median(v)) if col != "Defocus" else [_r(v.min()), _r(v.max())]
+    if "pixel_size_A" not in out:  # PixelSpacing may sit only in the file header or a [FrameSet] section
+        m = re.search(r"^\s*PixelSpacing\s*=\s*([0-9.]+)", text, re.M)
+        if m:
+            out["pixel_size_A"] = _r(float(m.group(1)))
     if "SubFramePath" in df.columns:
         names = [str(x).replace("\\", "/").split("/")[-1] for x in df["SubFramePath"].dropna()]
         out["subframe_files_first3"] = names[:3]

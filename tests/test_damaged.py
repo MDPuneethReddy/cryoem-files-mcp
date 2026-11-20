@@ -345,9 +345,28 @@ def test_mdoc_missing_tilts_zero_dose_duplicates(tmp_path):
     (tmp_path / "x.mdoc").write_text(
         "PixelSpacing = 1\n[ZValue = 0]\nTiltAngle = 0\nExposureDose = 0\n"
         "[ZValue = 1]\nTiltAngle = 0\nExposureDose = 0\n[ZValue = 2]\nExposureDose = 0\n"
+        "[ZValue = 3]\nTiltAngle = 6\nExposureDose = 0\n"
     )
     probs = " | ".join(parse_mdoc(tmp_path / "x.mdoc")["problems"])
-    assert "1 of 3 sections has no TiltAngle" in probs and "duplicate tilt" in probs and "not calibrated" in probs
+    assert "1 of 4 sections has no TiltAngle" in probs and "duplicate tilt" in probs and "not calibrated" in probs
+
+
+def test_mdoc_montage_and_frame_sets_are_not_flagged(tmp_path):
+    """Real SerialEM montages repeat one tilt and often have no dose; that is normal, not a problem."""
+    pieces = "".join(f"[ZValue = {i}]\nPieceCoordinates = {i * 100} 0 0\nTiltAngle = -0.0065\nExposureDose = 0\n" for i in range(6))
+    (tmp_path / "atlas.mdoc").write_text("PixelSpacing = 656.1\nMontage = 1\n\n" + pieces)
+    r = parse_mdoc(tmp_path / "atlas.mdoc")
+    assert r["acquisition"] == "montage" and r["montage_pieces"] == 6 and "problems" not in r
+    (tmp_path / "fs.mdoc").write_text(
+        "T = SerialEM\n\n[FrameSet = 0]\nTiltAngle = 32.986\nPixelSpacing = 1.2827\nExposureDose = 291.3\n\n"
+        + "".join(f"[ZValue = {i}]\nTiltAngle = 33\nExposureDose = 7.66\n" for i in range(4)))
+    r = parse_mdoc(tmp_path / "fs.mdoc")
+    assert r["pixel_size_A"] == 1.2827 and "problems" not in r and r["acquisition"] == "frame sets"
+
+
+def test_star_empty_quoted_values_are_legal(tmp_path):
+    (tmp_path / "q.star").write_text('data_\n\nloop_\n_a #1\n_b #2\nx ""\ny "z"\n')
+    assert "problems" not in summarize_star(tmp_path / "q.star")
 
 
 # ------------------------------------------------------------------ paths and folders
