@@ -121,9 +121,11 @@ def _mrc_role(name: str, shape: tuple) -> str:
     if len(shape) == 2 or shape[0] == 1:
         return "micrograph or 2D image"
     nz, ny, nx = shape[0], shape[1], shape[2]
+    if name.endswith(".mrcs"):  # the extension is explicit, even when the particle count equals the box size
+        return "particle stack"
     if nz == ny == nx:
         return "3D map/volume"
-    if name.endswith(".mrcs") or (nz > 50 and ny == nx and ny <= 512):
+    if nz > 50 and ny == nx and ny <= 512:
         return "particle stack"
     return "movie or image stack"
 
@@ -175,6 +177,10 @@ def inspect_mrc(path: Path, validate: bool = True) -> dict:
                        if lab.decode("latin-1").strip()][:3],
             "stats": sample_stats(m.data),
         }
+        mode = int(h.mode)
+        if mode in (3, 101):
+            out["note"] = (f"mode {mode} ({'4-bit packed' if mode == 101 else 'complex int16'}) is a valid MRC mode; "
+                           "decoded by this tool" + (" (stats are amplitudes)" if mode == 3 else ""))
         problems = list(m.integrity["warnings"]) + data_warnings(m.data)
         if float(vs.x) <= 0 or not np.isfinite(float(vs.x)):
             problems.append("pixel size in the header is 0 or invalid; set it before processing")
@@ -182,6 +188,9 @@ def inspect_mrc(path: Path, validate: bool = True) -> dict:
         m.close()
     if validate:
         ok, issues = capture_validate(path)
+        if mode in (3, 101):  # valid CCP-EM modes that mrcfile's validator does not know; this tool decodes them
+            issues = [i for i in issues if not i.startswith(("Invalid mode", "Data block could not be read"))]
+            ok = ok or not issues
         out["mrc2014_valid"] = ok
         if not ok:
             out["validation_issues"] = issues
@@ -229,6 +238,14 @@ def inspect_movie(path: Path, sample_frames: int = 5, verify_all_frames: bool = 
     if problems:
         out["problems"] = problems
     return out
+
+
+FLAG_LIST = 10  # files named per problem
+
+
+def _names(items: list[str]) -> str:
+    shown = ", ".join(items[:FLAG_LIST])
+    return shown + (f" and {len(items) - FLAG_LIST} more" if len(items) > FLAG_LIST else "")
 
 
 MRC_HEADER_CHECKS = 500  # header-vs-size checks per scan (1 KB read each)
@@ -343,7 +360,8 @@ def scan_directory(root: Path, pattern: str = "*", limit: int = 20000, max_depth
         problems.append(f"{plural(deeper_dirs, 'folder')} deeper than max_depth={max_depth} not scanned; "
                         "pass a larger max_depth to include them")
     if empty_files:
-        problems.append(f"{plural(len(empty_files), 'empty (0-byte) file')}, e.g. {', '.join(empty_files[:3])}: failed or in-progress copies")
+        problems.append(f"{plural(len(empty_files), 'empty (0-byte) file')}: {_names(empty_files)}. "
+                        "Likely cause: failed or in-progress copies")
     # same-type files much smaller than their siblings are usually incomplete copies
     suspicious = []
     for ext, items in by_ext_files.items():
@@ -353,9 +371,9 @@ def scan_directory(root: Path, pattern: str = "*", limit: int = 20000, max_depth
         small = [(n, s) for n, s in items if 0 < s < 0.5 * med]
         suspicious += small
     if suspicious:
-        ex = ", ".join(f"{n} ({_size(s)})" for n, s in suspicious[:3])
-        problems.append(f"{plural(len(suspicious), 'movie/image file')} less than half the typical size, possibly truncated: {ex}. "
-                        "Check them with identify_file")
+        ex = _names([f"{n} ({_size(s)})" for n, s in suspicious])
+        problems.append(f"{plural(len(suspicious), 'movie/image file')} less than half the typical size, possibly "
+                        f"truncated: {ex}. Check each with identify_file(verify_data=true)")
     # cheap header-vs-size check on MRC files (reads 1 KB each)
     mrc_files = [rel for ext in (".mrc", ".mrcs") for rel, _ in by_ext_files.get(ext, [])]
     mrc_bad = []
@@ -363,14 +381,15 @@ def scan_directory(root: Path, pattern: str = "*", limit: int = 20000, max_depth
         try:
             mrc_check(root / rel)
         except FileProblem as e:
-            mrc_bad.append(e.problem)
+            mrc_bad.append((rel, e.problem))
         except OSError:
             pass
     if mrc_bad:
-        problems.append(f"{plural(len(mrc_bad), 'damaged MRC file')}; first: {mrc_bad[0]}")
+        problems.append(f"{plural(len(mrc_bad), 'damaged MRC file')}: {_names([r for r, _ in mrc_bad])}. "
+                        f"First: {mrc_bad[0][0]}: {mrc_bad[0][1]}")
     if len(mrc_files) > MRC_HEADER_CHECKS:
-        notes.append(f"header-checked {MRC_HEADER_CHECKS} of {len(mrc_files)} MRC files; the rest were only checked "
-                     "by size. Scan subfolders separately (or use a pattern) to header-check them all")
+        notes.append(f"header-checked {MRC_HEADER_CHECKS} of {len(mrc_files)} MRC files; the rest were not "
+                     "header-checked. Scan subfolders separately (or use a pattern) to header-check them all")
     if movies and not gains:
         problems.append("movies found but no gain reference (no file with 'gain' in its name, .gain or .dm4)")
     if len(gains) > 1:
@@ -386,6 +405,8 @@ def scan_directory(root: Path, pattern: str = "*", limit: int = 20000, max_depth
     if truncated:
         problems.append(f"stopped after {limit} files; narrow the folder or pattern, or raise limit")
 
+    flagged = {"damaged_mrc": [r for r, _ in mrc_bad][:FLAG_LIST], "possibly_truncated": [n for n, _ in suspicious][:FLAG_LIST],
+               "empty": empty_files[:FLAG_LIST]}
     out = {
         "folder": display(root),
         "files_scanned": scanned,
@@ -398,6 +419,9 @@ def scan_directory(root: Path, pattern: str = "*", limit: int = 20000, max_depth
         "skipped": {"deeper_folders": deeper_dirs, "outside_symlinks": len(outside_links), "special_files": len(special)},
         "problems": problems,
     }
+    flagged = {k: v for k, v in flagged.items() if v}
+    if flagged:
+        out["flagged_files"] = flagged  # check each with identify_file(verify_data=true)
     if notes:
         out["notes"] = notes
     return out

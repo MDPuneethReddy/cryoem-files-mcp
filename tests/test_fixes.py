@@ -1,4 +1,4 @@
-"""Regression tests for the fixes to the 0.1.0 QA report (docs/QA-REPORT.md): one section per finding ID."""
+"""Regression tests for the fixes to the 0.1.0 QA report (docs/dev/QA-REPORT.md): one section per finding ID."""
 
 import os
 import subprocess
@@ -298,7 +298,7 @@ def test_argument_errors_are_short(tmp_path):
     assert "pydantic" not in msg and "http" not in msg and "\n" not in msg
 
 
-# ================================================================== pass 2 (docs/RESEARCH-NOTES.md, RELEASE-PLAN.md)
+# ================================================================== pass 2 (docs/dev/RESEARCH-NOTES.md, docs/dev/RELEASE-PLAN.md)
 
 import re  # noqa: E402
 
@@ -427,3 +427,222 @@ def test_unexpected_exception_is_reported_without_traceback(tmp_path, monkeypatc
     assert "internal error in identify_file: RuntimeError: boom second line." in msg
     assert server.ISSUES_URL in msg and "Traceback" not in msg and "\n" not in msg
     assert "Traceback" in capsys.readouterr().err
+
+
+# ================================================================== pass 3 (docs/dev/QA-REPORT-v2.md)
+
+import json  # noqa: E402
+
+from cryoem_files_mcp import formats as fmt_mod  # noqa: E402
+from cryoem_files_mcp import gain as gain_mod  # noqa: E402
+from cryoem_files_mcp.inspect import inspect_movie  # noqa: E402
+from cryoem_files_mcp.meta import parse_mdoc  # noqa: E402
+from mrcfile.dtypes import HEADER_DTYPE  # noqa: E402
+
+
+def _call_tool(name, args):
+    async def go():
+        try:
+            res = await server.mcp.call_tool(name, args)
+            return False, res
+        except server.ToolError as e:
+            return True, str(e)
+
+    return anyio.run(go)
+
+
+# ------------------------------------------------------------------ N1: non-UTF-8 names
+
+@pytest.mark.skipif(sys.platform == "darwin", reason="macOS refuses non-UTF-8 names")
+def test_non_utf8_filename_never_breaks_scan(tmp_path):
+    with open(os.path.join(os.fsencode(tmp_path), b"bad\xffutf8.gain"), "wb") as f:
+        f.write(b"x")
+    is_err, res = _call_tool("scan_directory", {"path": "."})
+    assert not is_err
+    text = res.content[0].text
+    assert "bad\\xffutf8.gain" in json.loads(text)["gain_references_found"][0]
+    assert server.safe({"a": "x\udcffy", "n": float("nan")}) == {"a": "x\\xffy", "n": None}
+
+
+def test_serialisation_failure_is_reported_as_internal_error(monkeypatch):
+    monkeypatch.setattr(server, "safe", lambda x: x)  # let a non-serialisable result reach the SDK
+    monkeypatch.setattr(insp, "scan_directory", lambda *a, **k: {"x": "bad\udcffname"})
+    is_err, msg = _call_tool("scan_directory", {"path": "."})
+    assert is_err and "internal error in scan_directory" in msg and server.ISSUES_URL in msg
+
+
+# ------------------------------------------------------------------ N2: MRC modes 101 and 3
+
+def _raw_mrc(path, mode, nx, ny, nz, data: bytes):
+    h = np.zeros(1, HEADER_DTYPE)
+    h["nx"], h["ny"], h["nz"], h["mode"] = nx, ny, nz, mode
+    h["mapc"], h["mapr"], h["maps"] = 1, 2, 3
+    h["cella"]["x"], h["cella"]["y"], h["cella"]["z"] = nx, ny, nz
+    h["mx"], h["my"], h["mz"] = nx, ny, nz
+    h["map"] = b"MAP "
+    h["machst"] = [0x44, 0x44, 0, 0]
+    h["nversion"] = 20140
+    path.write_bytes(h.tobytes() + data)
+    return path
+
+
+def test_mode_101_is_decoded_not_damaged(tmp_path):
+    nx, ny, nz = 63, 64, 10
+    pix = np.random.default_rng(0).integers(0, 16, (nz, ny, nx), dtype=np.uint8)
+    padded = np.concatenate([pix, np.zeros((nz, ny, 1), np.uint8)], axis=2)  # rows padded to whole bytes
+    packed = (padded[..., 0::2] | (padded[..., 1::2] << 4)).astype(np.uint8)
+    p = _raw_mrc(tmp_path / "frames_4bit.mrc", 101, nx, ny, nz, packed.tobytes())
+    r = identify_file(p, verify_data=True)
+    assert r["integrity"] == "ok", r
+    m = fmt_mod.open_mrc(p)
+    try:
+        assert np.array_equal(np.asarray(m.data), pix) and np.array_equal(m.data[3], pix[3])
+    finally:
+        m.close()
+    mi = inspect_mrc(p)
+    assert mi["mrc2014_valid"] and "mode 101" in mi["note"] and "problems" not in mi
+    assert inspect_movie(p)["frames"] == 10
+    cut_p = _raw_mrc(tmp_path / "cut.mrc", 101, nx, ny, nz, packed.tobytes()[:-100])
+    assert "100 bytes missing" in identify_file(cut_p)["problems"][0]
+
+
+def test_mode_3_complex_int16_is_decoded(tmp_path):
+    a = np.random.default_rng(1).integers(-50, 50, (8, 8, 2), dtype=np.int16)
+    p = _raw_mrc(tmp_path / "c.mrc", 3, 8, 8, 1, a.tobytes())
+    assert identify_file(p, verify_data=True)["integrity"] == "ok"
+    m = fmt_mod.open_mrc(p)
+    try:
+        assert np.allclose(np.asarray(m.data), a[..., 0] + 1j * a[..., 1])
+    finally:
+        m.close()
+
+
+# ------------------------------------------------------------------ N3: scan names flagged files
+
+def test_scan_names_damaged_and_truncated_files(tmp_path):
+    from .test_damaged import cut, good_movie_tif
+
+    for i in range(3):
+        cut(good_stack_mrc(tmp_path / f"bad_{i}.mrc"), 0.5)
+    for i in range(6):
+        good_movie_tif(tmp_path / f"movie_{i}.tif", n=20, compression=None)
+    cut(tmp_path / "movie_5.tif", 0.2)
+    r = scan_directory(tmp_path)
+    text = " | ".join(r["problems"])
+    assert "3 damaged MRC files: bad_0.mrc, bad_1.mrc, bad_2.mrc" in text
+    assert r["flagged_files"]["damaged_mrc"] == ["bad_0.mrc", "bad_1.mrc", "bad_2.mrc"]
+    assert r["flagged_files"]["possibly_truncated"] == ["movie_5.tif"]
+
+
+# ------------------------------------------------------------------ N4 / N5: gain size and CryoSPARC advice
+
+def test_double_size_gain_advice_bins_for_tiff_movies(tmp_path):
+    g = _gain((512, 512), 0.04, 21)
+    _movie(tmp_path / "m.tif", g, 0, False, 0.5, 20, 22, bin_to=True)
+    tifffile.imwrite(tmp_path / "g.gain", g)
+    r = check_orientation(tmp_path / "g.gain", tmp_path / "m.tif")
+    ns = r["next_step"]
+    assert "bin=2" in ns["motioncor"] and "bin=2" in ns["relion"] and "bin=2" in ns["cryosparc"]
+    out = convert_gain(tmp_path / "g.gain", rotate=0, bin=2, movie_type="tiff")
+    assert out["shape_yx"] == [256, 256]
+
+
+def test_cryosparc_entry_is_hedged_and_prompt_matches(tmp_path):
+    adv = _advice(tmp_path / "k3.dm4", "dm4", "tiff", 1, False, False, None)
+    assert "Not researched" in adv["cryosparc"] and "one movie" in adv["cryosparc"]
+    assert "movie_type" not in adv["cryosparc"]
+    eer = _advice(tmp_path / "old.mrc", "mrc", "eer", 0, False, True, "gain binned 2x to match movie")
+    assert "invert=true, bin=2" in eer["cryosparc"] and "4096x4096" in eer["cryosparc"] and "forum" in eer["cryosparc"]
+    assert "-EerSampling" in eer["motioncor"] and "bin=2" not in eer["relion"]
+    prompt = server.prepare_for("CryoSPARC", "/data")
+    assert "'cryosparc'" in prompt
+
+
+# ------------------------------------------------------------------ item 7 / N7: STAR '#' inside tokens and ';' lines
+
+def test_star_hash_inside_value_and_semicolon_lines(tmp_path):
+    (tmp_path / "s.star").write_text("\ndata_micrographs\n\nloop_\n_rlnMicrographName #1\n_rlnDefocusU #2\n"
+                                     "Movies/grid#2_001.mrc 12000\n; a text line\nother.mrc 13000 # note\n")
+    r = summarize_star(tmp_path / "s.star")
+    assert "problems" not in r and r["blocks"]["micrographs"]["rows"] == 2
+    assert r["blocks"]["micrographs"]["stats"]["defocus_U_A"]["max"] == 13000
+
+
+# ------------------------------------------------------------------ N6, N8, N9, N11, N12, N14
+
+def test_convert_replaces_nan_pixels_and_says_so(tmp_path):
+    g = make_gain((32, 32))
+    g[3] = np.nan
+    tifffile.imwrite(tmp_path / "nanrows.gain", g)
+    out = convert_gain(tmp_path / "nanrows.gain")
+    assert "32 gain pixels" in out["problems"][0] and "set to 0" in out["problems"][0]
+    with mrcfile.open(out["output"]) as m:
+        assert np.isfinite(m.data).all() and (m.data[3] == 0).all()
+
+
+def test_library_errors_are_readable(tmp_path, monkeypatch):
+    tifffile.imwrite(tmp_path / "rgb.tif", np.zeros((64, 64, 3), np.uint8))
+    assert "colour/multi-channel TIFF (3 samples per pixel)" in err(inspect_movie, tmp_path / "rgb.tif")
+    (tmp_path / "bad.mdoc").write_text("PixelSpacing = 1\n[ZValue = 0]\nTiltAngle = abc\n")
+    msg = err(parse_mdoc, tmp_path / "bad.mdoc")
+    assert "TiltAngle" in msg and "http" not in msg and "\n" not in msg
+    tifffile.imwrite(tmp_path / "g.gain", make_gain((16, 16)))
+    is_err, msg = _call_tool("convert_gain", {"gain": "g.gain", "out": "x" * 300 + ".mrc"})
+    assert is_err and "File name too long" in msg and str(tmp_path) not in msg and "Fix:" in msg
+    good_stack_mrc(tmp_path / "s.mrc")
+    tifffile.imwrite(tmp_path / "m.tif", np.zeros((2, 8, 8), np.uint8))
+    assert "Fix: use inspect_movie" in err(inspect_mrc, tmp_path / "m.tif")
+
+
+def test_memory_error_while_decoding_is_not_called_corruption(tmp_path, monkeypatch):
+    tifffile.imwrite(tmp_path / "m.tif", np.zeros((2, 8, 8), np.uint8), compression="zlib")
+
+    def no_memory(*a, **k):
+        raise MemoryError
+
+    monkeypatch.setattr(tifffile.TiffPage, "asarray", no_memory)
+    msg = err(inspect_movie, tmp_path / "m.tif")
+    assert "not enough memory to decode it" in msg and "corrupted" not in msg
+
+
+def test_out_equal_to_input_is_refused(tmp_path):
+    with mrcfile.new(tmp_path / "g.mrc") as m:
+        m.set_data(make_gain((16, 16)))
+    msg = err(convert_gain, tmp_path / "g.mrc", out="g.mrc", overwrite=True)
+    assert "is the input file" in msg
+    assert not (tmp_path / "g_converted.mrc").exists()
+
+
+def test_concurrent_converts_to_same_out_all_succeed(tmp_path):
+    tifffile.imwrite(tmp_path / "g.gain", make_gain((256, 256)))
+    errors = []
+
+    def one():
+        try:
+            convert_gain(tmp_path / "g.gain", out="same.mrc", overwrite=True)
+        except Exception as e:  # noqa: BLE001
+            errors.append(str(e))
+
+    threads = [threading.Thread(target=one) for _ in range(12)]
+    [t.start() for t in threads]
+    [t.join(60) for t in threads]
+    assert not errors and not list(tmp_path.glob("*.partial"))
+    with mrcfile.open(tmp_path / "same.mrc") as m:
+        assert m.data.shape == (256, 256)
+
+
+def test_heavy_operations_are_limited(monkeypatch):
+    monkeypatch.setattr(server, "TIMEOUT_S", 1.2)
+    sem = threading.BoundedSemaphore(1)
+    sem.acquire()  # one slot, already taken by a "stuck" call
+    monkeypatch.setattr(server, "_heavy", sem)
+    with pytest.raises(server.ToolError, match="server busy"):
+        server._call(lambda: 1, "convert_gain", heavy=True)
+    assert server._call(lambda: 2, "inspect_mrc") == 2  # light calls are not limited
+
+
+def test_no_match_mentions_low_signal(tmp_path):
+    tifffile.imwrite(tmp_path / "g.gain", make_gain((64, 64), seed=1))
+    _movie(tmp_path / "m.tif", make_gain((64, 64), seed=2), 0, False, 3.0, 5, 3)
+    r = check_orientation(tmp_path / "g.gain", tmp_path / "m.tif")
+    assert r["confidence"] == "no_match" and "raise n_frames" in r["problem"]

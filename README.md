@@ -18,7 +18,7 @@ Runs locally over stdio. Nothing is uploaded; there is no server to host.
 | `convert_gain` | Float32 MRC gain with rotate/flip/2x-bin/invert baked in (applied in that order), plus the row flip TIFF movies need (`movie_type='tiff'`) | New file (overwrites only with `overwrite=true`) |
 | `summarize_star` | RELION STAR blocks, optics groups, defocus/CTF/class stats | No |
 | `parse_mdoc` | SerialEM tilt range, step, dose, pixel size | No |
-| `scan_directory` | File counts by type, gain references found, obvious problems. `max_depth` (default 8 folder levels), `limit` (default 20,000 files); reports what it skipped | No |
+| `scan_directory` | File counts by type, gain references found, obvious problems. `max_depth` (default 8 folder levels), `limit` (default 20,000 files); names the flagged files (`flagged_files`) and reports what it skipped | No |
 
 Also: resource `cryoem://formats` (gain conventions cheat sheet) and prompts `diagnose_dataset`, `prepare_for`.
 
@@ -93,21 +93,23 @@ Variant names are in array view: `rot90` means `numpy.rot90(gain, 1)`, counter-c
 - **Row order.** MotionCor and RELION read TIFF movie rows bottom-up, but MRC (and EER) rows as stored. A gain matched to a TIFF movie is therefore written upside down (`movie_type='tiff'`). EER and MRC movies need no flip.
 - **RELION and EER.** RELION picks the gain convention for EER movies from the file extension: it multiplies by a `.gain` file and divides by anything else, MRC included. For RELION with EER, keep the original `.gain` or write a divisive MRC. For TIFF and MRC movies RELION multiplies, like MotionCor.
 
-`check_gain_orientation` returns the exact `convert_gain` call for MotionCor and for RELION in `next_step`.
+`check_gain_orientation` returns the exact `convert_gain` call for MotionCor and for RELION in `next_step`. When the gain is twice the movie frame size (8K gain, 4K movie), those calls include `bin=2` where the program needs a same-size gain. `next_step.cryosparc` is a hedged suggestion only: CryoSPARC's gain row-order handling has not been researched, so check one movie and use its "Flip gain ref in Y" option if the detector pattern remains.
 
 ## Safety
 
 - Read tools never modify files.
-- `convert_gain` writes a new file and refuses to overwrite anything (including its input) unless `overwrite=true`.
+- `convert_gain` writes a new file and overwrites an existing output only with `overwrite=true`. It never overwrites its input, even with `overwrite=true`. NaN or infinite gain pixels are set to 0 (defects) and reported under `problems`.
 - Paths outside the allowed roots are refused, including through symlinks; error messages show the path as given, never where a symlink points. `scan_directory` skips (and counts) symlinks that lead outside the roots without reading them.
 - Named pipes, devices and sockets are never opened (reading them can block forever); `scan_directory` skips and counts them.
-- Stale network mounts: a read on a hung NFS/GPFS mount blocks inside the kernel and cannot be interrupted. The call returns a timeout error after `--timeout` seconds and the server stays usable, but the stuck worker thread remains until the mount recovers. Check the mount (`ls` the folder in a terminal) if calls time out.
+- Stale network mounts: a read on a hung NFS/GPFS mount blocks inside the kernel and cannot be interrupted. The call returns a timeout error after `--timeout` seconds and the server stays usable, but the stuck worker thread remains until the mount recovers. Check the mount (`ls` the folder in a terminal) if calls time out. A call that times out because the data is large also keeps computing in the background; to bound memory, at most 2 heavy operations (orientation check, gain conversion, full-frame verification) run at once, and further ones wait or report "server busy".
+- Filenames that are not valid UTF-8 (common after Windows/Samba copies) are shown with `\xNN` escapes instead of breaking the result.
 
 ## Status and known limits (v0.1)
 
 - **Check one movie first.** The gain row order and MotionCor/RELION conventions come from reading their source code, not from a run on real data. Before processing a whole dataset with a converted gain, run motion correction on one movie and check that the corrected sum shows no detector pattern (seams, stripes).
 - Tested only on synthetic data (all 8 orientations, both conventions, 4K/8K binning, ~50 damaged or unusual files). Not yet validated on real K3, Falcon 4 or EER datasets; please report results.
 - EER support is untested on real files.
+- MRC modes 3 (complex int16) and 101 (4-bit packed, SerialEM) are decoded by this tool itself, because `mrcfile` cannot map them; checked on synthetic files only.
 - `.dm4` reading uses `ncempy` and is untested on real Gatan gains; compare against IMOD `dm2mrc` before trusting it.
 - CryoSPARC statements (EER gain size, `.dm4`) come from CryoSPARC forum reports (2021, 2023), not the official guide.
 - `scan_directory` reports when it did not look at everything (deeper folders, MRC header-check cap); read its notes.

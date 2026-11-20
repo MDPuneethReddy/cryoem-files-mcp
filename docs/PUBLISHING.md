@@ -14,7 +14,7 @@ Anthropic's directory no longer accepts MCPB desktop extensions; a local MCP ser
 - **Claude Cowork:** skips the server. Cowork never prompts for plugin settings and ignores an MCP server that uses `${user_config.*}` without a default. No default is set on purpose: there is no folder that is safe for everyone (a home-folder default would expose the whole home directory).
 - **Claude chat:** does not run local MCP servers.
 
-Sources (checked 2026-11-19): [Publish to the directory](https://claude.com/docs/directory/publish), [Submit your plugin](https://claude.com/docs/plugins/submit), [Plugin pre-submission checklist](https://claude.com/docs/plugins/pre-submission-checklist), [Plugin manifest reference](https://code.claude.com/docs/en/plugins-reference), [MCP Registry GitHub Actions](https://github.com/modelcontextprotocol/registry/blob/main/docs/modelcontextprotocol-io/github-actions.mdx), [PyPI: creating a project through OIDC](https://docs.pypi.org/trusted-publishers/creating-a-project-through-oidc/). Details and evidence: `docs/RESEARCH-NOTES.md`.
+Sources (checked 2026-11-19): [Publish to the directory](https://claude.com/docs/directory/publish), [Submit your plugin](https://claude.com/docs/plugins/submit), [Plugin pre-submission checklist](https://claude.com/docs/plugins/pre-submission-checklist), [Plugin manifest reference](https://code.claude.com/docs/en/plugins-reference), [MCP Registry GitHub Actions](https://github.com/modelcontextprotocol/registry/blob/main/docs/modelcontextprotocol-io/github-actions.mdx), [PyPI: creating a project through OIDC](https://docs.pypi.org/trusted-publishers/creating-a-project-through-oidc/). Details and evidence: `docs/dev/RESEARCH-NOTES.md`.
 
 ## Version strings
 

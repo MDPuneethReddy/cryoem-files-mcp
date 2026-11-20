@@ -103,6 +103,21 @@ tifffile.imwrite(d / "other.gain", make_gain((256, 256), seed=9))
 case("Gain that does not belong to the movie (orientation)", check_orientation, d / "other.gain", d / "raw.tif")
 case("Invalid scan limit", scan_directory, s, limit=-5)
 case("convert_gain with an unknown movie_type", convert_gain, d / "g64.gain", movie_type="dm4")
+tifffile.imwrite(d / "rgb.tif", np.zeros((64, 64, 3), np.uint8))
+case("Colour (RGB) TIFF given as a movie", inspect_movie, d / "rgb.tif")
+case("TIFF movie given to inspect_mrc", inspect_mrc, good_movie_tif(d / "mv.tif"))
+with mrcfile.new(d / "in.mrc") as m:
+    m.set_data(make_gain((32, 32)))
+case("convert_gain with out= equal to the input", convert_gain, d / "in.mrc", out="in.mrc", overwrite=True)
+gn = make_gain((32, 32)); gn[2] = np.nan
+tifffile.imwrite(d / "nanrow.gain", gn)
+case("Gain with a NaN row (convert_gain)", convert_gain, d / "nanrow.gain")
+(d / "bad.mdoc").write_text("PixelSpacing = 1\n[ZValue = 0]\nTiltAngle = abc\n")
+case("mdoc with a non-numeric TiltAngle", parse_mdoc, d / "bad.mdoc")
+s2 = d / "flagged"; s2.mkdir()
+for i in range(2):
+    cut(good_stack_mrc(s2 / f"bad_{i}.mrc"), 0.5)
+case("Session folder with two truncated MRC files", scan_directory, s2)
 
 out = Path(__file__).resolve().parents[1] / "docs" / "error-messages.md"
 lines = ["# Error messages for damaged files", "",

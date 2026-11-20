@@ -8,7 +8,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .formats import FileProblem, check_basic, plural
+from .formats import FileProblem, check_basic, plural, short_error
 
 
 def _r(x) -> float:
@@ -78,6 +78,70 @@ def _split_row(line: str) -> list[str]:
     return tokens
 
 
+def _unquote(t: str) -> str:
+    return t[1:-1] if len(t) >= 2 and t[0] == t[-1] and t[0] in "'\"" else t
+
+
+def _needs_own_parser(text: str) -> bool:
+    """starfile (pandas) treats every '#' as a comment and counts ';' lines as rows. RELION only starts a comment
+    with '#' at the start of a token, so 'grid#2_001.mrc' is a legal value."""
+    for line in text.splitlines():
+        s = line.strip()
+        if s.startswith(";"):
+            return True
+        if "#" in s and not s.startswith(("#", "_")):
+            if any("#" in t[1:] and t[0] not in "'\"" for t in _split_row(s)):
+                return True
+    return False
+
+
+def _parse_star(text: str) -> dict:
+    """Minimal RELION-style STAR reader (blocks, loops, key-value pairs) with RELION's token rules."""
+    import pandas as pd
+
+    blocks: dict = {}
+    name, cols, rows, kv, in_loop = None, [], [], {}, False
+
+    def flush():
+        if name is None:
+            return
+        if cols:
+            df = pd.DataFrame([r[: len(cols)] + [None] * (len(cols) - len(r)) for r in rows], columns=cols)
+            for c in cols:
+                num = pd.to_numeric(df[c], errors="coerce")
+                if num.notna().sum() == df[c].notna().sum():
+                    df[c] = num
+            blocks[name] = df
+        else:
+            blocks[name] = kv
+
+    for line in text.splitlines():
+        s = line.strip()
+        if not s or s.startswith(("#", ";")):
+            continue
+        if s.startswith("data_"):
+            flush()
+            name, cols, rows, kv, in_loop = s[5:], [], [], {}, False
+            continue
+        if s == "loop_":
+            in_loop, cols, rows = True, [], []
+            continue
+        toks = [_unquote(t) for t in _split_row(s)]
+        if not toks:
+            continue
+        if s.startswith("_"):
+            if in_loop and not rows:
+                cols.append(toks[0][1:])
+            else:
+                in_loop = False
+                kv[toks[0][1:]] = toks[1] if len(toks) > 1 else ""
+            continue
+        if in_loop:
+            rows.append(toks)
+    flush()
+    return blocks
+
+
 def _loop_row_problems(text: str) -> list[str]:
     """Find data rows whose field count differs from the loop's column count (pandas silently pads short rows)."""
     problems = []
@@ -119,9 +183,9 @@ def summarize_star(path: Path) -> dict:
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            blocks = starfile.read(path, always_dict=True)
+            blocks = _parse_star(text) if _needs_own_parser(text) else starfile.read(path, always_dict=True)
     except Exception as e:
-        msg = str(e).strip().splitlines()[0][:200]
+        msg = short_error(e)
         if row_problems:
             what = f"is malformed: rows with the wrong number of values: {'; '.join(row_problems)}."
         else:
@@ -199,7 +263,7 @@ def parse_mdoc(path: Path) -> dict:
         bad = [f"line {i}: '{ln.strip()[:40]}'" for i, ln in enumerate(text.splitlines(), 1)
                if ln.strip() and not ln.strip().startswith("[") and "=" not in ln][:3]
         where = f" Lines that are not 'key = value': {'; '.join(bad)}." if bad else ""
-        raise FileProblem(path, f"is malformed and could not be parsed ({type(e).__name__}: {e}).{where}",
+        raise FileProblem(path, f"is malformed and could not be parsed ({short_error(e)}).{where}",
                           cause="damaged or hand-edited file", fix="fix those lines or re-export the mdoc from SerialEM") from None
     if len(df) == 0:
         raise FileProblem(path, "has no tilt/frame sections with data.", cause="truncated file")

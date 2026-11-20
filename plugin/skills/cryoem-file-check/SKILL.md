@@ -9,13 +9,13 @@ Use the `cryoem-files` MCP tools. They return short summaries; never try to read
 
 ## A whole session folder
 1. `scan_directory` on the folder. Report its `problems` first (empty files, possibly truncated files, damaged MRCs, missing gain, folders deeper than `max_depth`). Mention its `notes` and `skipped` counts (MRC headers only partly checked, symlinks outside the allowed folders, pipes or devices); if deeper folders were skipped, re-run with a larger `max_depth`.
-2. For each file it flags, run `identify_file` with `verify_data=true` to get the exact damage (byte, frame).
+2. For each file listed in `flagged_files` (damaged MRCs, possibly truncated, empty), run `identify_file` with `verify_data=true` to get the exact damage (byte, frame).
 3. `inspect_movie` on one normal movie, `inspect_gain` on the gain.
 
 ## A gain reference
 1. `inspect_gain`, then `check_gain_orientation` with one raw movie (integer counts, not gain-normalised). Ask which program the user runs (MotionCor or RELION) if it is not clear.
 2. Act on `confidence`:
-   - `high`: run the exact `convert_gain` call from `next_step.motioncor` or `next_step.relion` (they differ for EER movies; both pass `movie_type`, which adds the row flip TIFF movies need). For MotionCor, the converted gain is used with `-Gain <output> -RotGain 0 -FlipGain 0` and no `-InvGain`. For RELION with EER, follow `next_step.relion` (keep the original `.gain`, or a divisive MRC).
+   - `high`: run the exact `convert_gain` call from `next_step.motioncor` or `next_step.relion` (they differ for EER movies; both pass `movie_type`, which adds the row flip TIFF movies need). For MotionCor, the converted gain is used with `-Gain <output> -RotGain 0 -FlipGain 0` and no `-InvGain`. For RELION with EER, follow `next_step.relion` (keep the original `.gain`, or a divisive MRC). The calls include `bin=2` when the gain is twice the movie size. For CryoSPARC, `next_step.cryosparc` is hedged: say it is not researched in detail and that the user must check one movie (and use CryoSPARC's gain flip option if the pattern remains).
    - `medium`: report the suggested orientation as probable, quote the `warning` and `z_best`/`z_gap`, and re-run with `n_frames=50` or more. Convert only if the re-run is `high`, or if the user asks to proceed.
    - `low`: the gain matches but two orientations tie. Say so, quote the `warning`, and ask for another raw movie or more frames. Do not pick one.
    - `no_match`: tell the user this gain does not belong to these movies (or the movie is already gain-normalised); quote the `problem`. Do not suggest an orientation or convert anything.

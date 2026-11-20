@@ -52,6 +52,23 @@ class FileProblem(ValueError):
         super().__init__(msg)
 
 
+def short_error(e: BaseException) -> str:
+    """One readable line from a library exception (pydantic: field, message and value; no URLs)."""
+    errs = getattr(e, "errors", None)
+    if callable(errs):
+        try:
+            parts = []
+            for x in errs()[:3]:
+                loc = ".".join(str(p) for p in x.get("loc", ())) or "value"
+                parts.append(f"{loc}: {x.get('msg', 'invalid')} (got {str(x.get('input'))[:40]!r})")
+            if parts:
+                return "; ".join(parts)
+        except Exception:  # noqa: BLE001
+            pass
+    lines = [ln for ln in str(e).splitlines() if ln.strip() and "http" not in ln]
+    return (lines[0].strip() if lines else type(e).__name__)[:200]
+
+
 RECOPY = "re-copy the file from the microscope/storage and compare its size with the original"
 
 
@@ -183,8 +200,19 @@ def check_format(path: Path, allowed: set[str] | None = None) -> str:
         )
     if allowed is not None and fmt not in allowed:
         want = ", ".join(sorted(FORMAT_NAMES[a] for a in allowed))
-        raise FileProblem(path, f"is {FORMAT_NAMES[fmt]}, but this tool needs {want}.")
+        raise FileProblem(path, f"is {FORMAT_NAMES[fmt]}, but this tool needs {want}.", fix=_TOOL_FOR.get(fmt, _TOOL_FOR[None]))
     return fmt
+
+
+_TOOL_FOR = {
+    "mrc": "use inspect_mrc (or inspect_movie / inspect_gain for MRC movies and gains)",
+    "tiff": "use inspect_movie for TIFF movies or inspect_gain for TIFF gains",
+    "bigtiff": "use inspect_movie for TIFF movies or inspect_gain for TIFF gains",
+    "eer": "use inspect_movie for EER movies",
+    "dm4": "use inspect_gain for Gatan gains", "dm3": "use inspect_gain for Gatan gains",
+    "star": "use summarize_star", "mdoc": "use parse_mdoc",
+    None: "use identify_file to see what the file is",
+}
 
 
 # ---------------------------------------------------------------- MRC
@@ -201,6 +229,8 @@ def _plausible_mrc_header(head: bytes) -> bool:
 def mrc_check(path: Path) -> dict:
     """Validate an MRC header against the file size. Returns header facts; raises FileProblem if unusable."""
     size = check_basic(path)
+    if detect_format(path) in ("tiff", "bigtiff", "eer", "star", "mdoc", "dm4", "dm3"):
+        check_format(path, {"mrc"})  # clearly another format: say which, and which tool to use
     if size < 1024:
         raise FileProblem(path, f"is only {size} bytes; an MRC header alone needs 1024.",
                           cause="the file is truncated (incomplete copy)", fix=RECOPY)
@@ -244,9 +274,80 @@ def mrc_check(path: Path) -> dict:
     return {"nx": nx, "ny": ny, "nz": nz, "mode": mode, "big_endian": big_endian, "warnings": warnings_}
 
 
+class _Packed4Bit:
+    """Lazy view of MRC mode 101 data (two 4-bit pixels per byte, low nibble first, rows padded to whole bytes)."""
+
+    dtype = np.dtype(np.uint8)
+
+    def __init__(self, raw: np.ndarray, nx: int):
+        self._raw, self._nx = raw, nx  # raw: (nz, ny, (nx+1)//2) uint8 memmap
+        nz, ny, _ = raw.shape
+        self.shape = (ny, nx) if nz == 1 else (nz, ny, nx)
+        self.ndim = len(self.shape)
+        self.size = int(np.prod(self.shape))
+
+    def _unpack(self, b: np.ndarray) -> np.ndarray:
+        out = np.empty(b.shape[:-1] + (b.shape[-1] * 2,), np.uint8)
+        out[..., 0::2] = b & 0x0F
+        out[..., 1::2] = b >> 4
+        return out[..., : self._nx]
+
+    def __getitem__(self, i):
+        if self.ndim == 2:
+            return self._unpack(np.asarray(self._raw[0]))[i]
+        return self._unpack(np.asarray(self._raw[i]))
+
+    def __array__(self, dtype=None, copy=None):
+        a = self._unpack(np.asarray(self._raw))
+        a = a[0] if self.ndim == 2 else a
+        return a.astype(dtype) if dtype is not None else a
+
+    def reshape(self, *shape):
+        return np.asarray(self).reshape(*shape)
+
+
+class _ModeView:
+    """An mrcfile header (header_only) plus data this tool decodes itself, for valid modes mrcfile cannot map
+    (3 = complex int16, 101 = 4-bit packed)."""
+
+    def __init__(self, path: Path, info: dict):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            self._h = mrcfile.open(path, mode="r", permissive=True, header_only=True)
+            self.header = self._h.header
+            np_err = np.seterr(all="ignore")
+            try:
+                self.voxel_size = self._h.voxel_size
+            finally:
+                np.seterr(**np_err)
+        nx, ny, nz, mode = info["nx"], info["ny"], info["nz"], info["mode"]
+        offset = 1024 + int(self.header.nsymbt)
+        end = ">" if info["big_endian"] else "<"
+        if mode == 101:
+            raw = np.memmap(path, dtype=np.uint8, mode="r", offset=offset, shape=(nz, ny, (nx + 1) // 2))
+            self.data = _Packed4Bit(raw, nx)
+        else:  # mode 3: pairs of int16 (real, imaginary)
+            raw = np.memmap(path, dtype=end + "i2", mode="r", offset=offset, shape=(nz, ny, nx, 2))
+            c = raw[..., 0].astype(np.float32) + 1j * raw[..., 1].astype(np.float32)
+            self.data = c.astype(np.complex64)[0] if nz == 1 else c.astype(np.complex64)
+        self._raw = raw
+
+    def close(self):
+        self._h.close()
+        self._raw = None
+
+
 def open_mrc(path: Path):
     """Integrity-check, then memory-map. The caller closes it."""
     info = mrc_check(path)
+    if info["mode"] in (3, 101):  # valid MRC2014 modes that mrcfile cannot map: decode them here
+        try:
+            m = _ModeView(path, info)
+        except MemoryError:
+            raise FileProblem(path, f"is a valid MRC file (mode {info['mode']}), but there is not enough memory to "
+                                    "decode it.", fix="run on a machine with more memory") from None
+        m.integrity = info
+        return m
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
@@ -255,7 +356,10 @@ def open_mrc(path: Path):
         raise FileProblem(path, f"could not be opened as MRC: {e}.", fix=RECOPY) from None
     if m.data is None:
         m.close()
-        raise FileProblem(path, "MRC header was read but its data block could not be mapped.", fix=RECOPY)
+        raise FileProblem(path, f"is a valid MRC header (mode {info['mode']}), but its data block could not be "
+                                "mapped by mrcfile.",
+                          cause="an unusual MRC variant this tool cannot decode, or a damaged file",
+                          fix="check the file with IMOD (header in.mrc); if IMOD reads it, it is not damaged") from None
     m.integrity = info
     return m
 
@@ -286,6 +390,16 @@ def _quiet_tifffile():
         logger.propagate = old
 
 
+def _check_samples(path: Path, t: tifffile.TiffFile) -> None:
+    page = t.pages.first
+    spp = int(getattr(page, "samplesperpixel", 1) or 1)
+    if spp > 1 and len(page.shape) == 3 and page.shape[-1] == spp:  # interleaved RGB(A); planar stacks are movies
+        t.close()
+        raise FileProblem(path, f"is a colour/multi-channel TIFF ({spp} samples per pixel), not a detector movie or "
+                                "gain reference.", cause="a screenshot or exported picture rather than raw data",
+                          fix="pass the raw movie or gain file from the microscope")
+
+
 def open_tiff(path: Path) -> tuple[tifffile.TiffFile, int]:
     """Open a TIFF/BigTIFF/EER and verify the page chain and every page's data lie inside the file."""
     size = check_basic(path)
@@ -312,6 +426,7 @@ def open_tiff(path: Path) -> tuple[tifffile.TiffFile, int]:
     if n == 0:
         t.close()
         raise FileProblem(path, "is a TIFF with no pages (no image data).", fix=RECOPY)
+    _check_samples(path, t)
     for i, page in enumerate(t.pages):
         offs = getattr(page, "dataoffsets", ()) or ()
         cnts = getattr(page, "databytecounts", ()) or ()
@@ -332,6 +447,14 @@ def decode_page(path: Path, t: tifffile.TiffFile, i: int, n: int) -> np.ndarray:
     try:
         with _quiet_tifffile():
             return t.pages[i].asarray()
+    except MemoryError:
+        page = t.pages[i]
+        need = int(np.prod(page.shape)) * page.dtype.itemsize if page.dtype is not None else 0
+        raise FileProblem(path, f"frame {i + 1} of {n}: not enough memory to decode it "
+                                f"({'x'.join(str(x) for x in page.shape)} {page.dtype}, about {_mb(need)}).",
+                          cause="the machine (or the server's memory limit) has too little free memory",
+                          fix="close other programs or run on a machine with more memory; the file is not "
+                              "necessarily damaged") from None
     except Exception as e:
         kind = type(e).__name__
         hint = ""
@@ -413,7 +536,8 @@ def data_warnings(a: np.ndarray, what: str = "image") -> list[str]:
     out = []
     flat = np.asarray(a).reshape(-1)
     step = max(1, flat.size // 4_000_000)
-    s = flat[::step].astype(np.float64)
+    s = flat[::step]
+    s = (np.abs(s) if np.iscomplexobj(s) else s).astype(np.float64)
     nonfinite = ~np.isfinite(s)
     if nonfinite.all():
         return [f"every {what} pixel is NaN or infinite: the data is unusable"]
@@ -493,7 +617,8 @@ def sample_stats(a: np.ndarray, max_points: int = 2_000_000) -> dict:
     """min/max/mean/std from a strided sample so huge arrays stay cheap (NaN/inf ignored)."""
     flat = np.asarray(a).reshape(-1)
     step = max(1, flat.size // max_points)
-    s = np.asarray(flat[::step], dtype=np.float64)
+    s = flat[::step]
+    s = np.asarray(np.abs(s) if np.iscomplexobj(s) else s, dtype=np.float64)  # complex: amplitudes
     finite = s[np.isfinite(s)]
     if finite.size == 0:
         return {"min": None, "max": None, "mean": None, "std": None}
@@ -510,5 +635,6 @@ def capture_validate(path: Path) -> tuple[bool, list[str]]:
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         ok = mrcfile.validate(str(path), print_file=buf)
-    issues = [line.strip() for line in buf.getvalue().splitlines() if line.strip()]
+    issues = [line.strip().replace(str(path), path.name) for line in buf.getvalue().splitlines()
+              if line.strip() and not line.strip().startswith("Checking if")]
     return bool(ok), issues[:8]

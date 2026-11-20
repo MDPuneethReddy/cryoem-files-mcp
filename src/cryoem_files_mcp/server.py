@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import errno
+import math
 import os
+import threading
 import sys
 import traceback
 from importlib import resources
@@ -11,6 +14,7 @@ from pathlib import Path
 from typing import Annotated, Literal
 
 import anyio
+import numpy as np
 import anyio.to_thread
 from pydantic import Field, ValidationError
 
@@ -22,7 +26,7 @@ from . import __version__
 from . import gain as gain_mod
 from . import inspect as insp
 from . import meta
-from .paths import get_roots, resolve, set_roots
+from .paths import display, get_roots, resolve, set_roots
 
 # Longest a single tool call may run. A read on a stale network mount (NFS/GPFS) can block inside the
 # kernel; the call then returns an error after this many seconds instead of hanging the session.
@@ -31,32 +35,93 @@ TIMEOUT_S = float(os.environ.get("CRYOEM_MCP_TIMEOUT", "300"))
 
 ISSUES_URL = "https://github.com/MDPuneethReddy/cryoem-files-mcp/issues"
 
+# Heavy operations (orientation check, convert, full-frame verification) can each use about a gigabyte on full-size
+# data. A timed-out call's thread keeps running (Python threads cannot be killed), so retries could pile up; at most
+# HEAVY_SLOTS run at once, and a further call waits for a slot (or reports that the server is busy).
+HEAVY_SLOTS = 2
+_heavy = threading.BoundedSemaphore(HEAVY_SLOTS)
 
-def _call(fn, tool: str = "tool"):
+
+def safe_text(s: str) -> str:
+    """Make any string JSON-safe: undecodable filename bytes (surrogate escapes) are shown as \\xNN."""
+    try:
+        s.encode("utf-8")
+        return s
+    except UnicodeEncodeError:
+        try:
+            return s.encode("utf-8", "surrogateescape").decode("utf-8", "backslashreplace")
+        except UnicodeEncodeError:
+            return s.encode("utf-8", "backslashreplace").decode("utf-8")
+
+
+def safe(obj):
+    """Recursively make a tool result JSON-safe (odd filenames, NaN/inf, numpy scalars)."""
+    if isinstance(obj, str):
+        return safe_text(obj)
+    if isinstance(obj, dict):
+        return {safe(k): safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [safe(v) for v in obj]
+    if isinstance(obj, np.generic):
+        obj = obj.item()
+    if isinstance(obj, float) and not math.isfinite(obj):
+        return None
+    if isinstance(obj, (Path, bytes)):
+        return safe_text(os.fsdecode(obj))
+    return obj
+
+
+def _os_error_text(e: OSError) -> str:
+    name = display(Path(os.fsdecode(e.filename)))
+    if len(name) > 120:
+        name = name[:60] + "..." + name[-50:]
+    reason = e.strerror or type(e).__name__
+    if e.errno == errno.ENAMETOOLONG:
+        return f"{name}: {reason}. Likely cause: the file name or path is longer than the filesystem allows. " \
+               "Fix: use a shorter name (out=) or a shorter folder path."
+    if isinstance(e, PermissionError):
+        return f"{name}: {reason}. Fix: check the permissions of the file and its folder (ls -l)."
+    return f"{name}: {reason}. Likely cause: a storage, permission or network filesystem problem. " \
+           "Fix: check the file and folder in a terminal."
+
+
+def _internal(tool: str, e: BaseException) -> ToolError:
+    msg = " ".join(safe_text(str(e)).split())[:300]
+    return ToolError(f"internal error in {tool}: {type(e).__name__}: {msg}. Please report at {ISSUES_URL}")
+
+
+def _call(fn, tool: str = "tool", heavy: bool = False):
     """Run a tool body. Expected problems (bad path, wrong format, file exists) reach the model with their reason;
     anything else is a bug: the client gets the exception type and message (no traceback), stderr gets the traceback."""
+    if heavy and not _heavy.acquire(timeout=max(TIMEOUT_S - 1, 0.1)):
+        raise ToolError(f"server busy: {HEAVY_SLOTS} heavy operations (orientation check, gain conversion, full "
+                        "verification) are still running, possibly left over from calls that timed out. Fix: wait "
+                        "for them to finish and retry, or restart the server.")
     try:
-        return fn()
+        return safe(fn())
     except ToolError:
         raise
-    except (ValueError, OSError) as e:  # PathNotAllowed is a ValueError; FileExistsError/FileNotFoundError are OSError
-        raise ToolError(str(e)) from e
+    except OSError as e:  # FileExistsError/FileNotFoundError from paths.py carry a ready message and no filename
+        raise ToolError(_os_error_text(e) if e.filename else safe_text(str(e))) from e
+    except ValueError as e:  # FileProblem and PathNotAllowed are ValueErrors
+        raise ToolError(safe_text(str(e))) from e
     except Exception as e:  # noqa: BLE001  (MemoryError, library RuntimeError/KeyError, unexpected layouts)
         print(f"cryoem-files-mcp: internal error in {tool}:", file=sys.stderr)
         traceback.print_exc(file=sys.stderr)
-        msg = " ".join(str(e).split())[:300]
-        raise ToolError(f"internal error in {tool}: {type(e).__name__}: {msg}. "
-                        f"Please report at {ISSUES_URL}") from None
+        raise _internal(tool, e) from None
+    finally:
+        if heavy:
+            _heavy.release()
 
 
-async def _run(fn, tool: str = "tool"):
+async def _run(fn, tool: str = "tool", heavy: bool = False):
     """Run a blocking tool body on a worker thread, giving up after TIMEOUT_S.
 
     A thread stuck in the kernel (stale mount) cannot be killed; it is abandoned and the client gets an error.
     """
     try:
         with anyio.fail_after(TIMEOUT_S):
-            return await anyio.to_thread.run_sync(lambda: _call(fn, tool), abandon_on_cancel=True)
+            return await anyio.to_thread.run_sync(lambda: _call(fn, tool, heavy), abandon_on_cancel=True)
     except TimeoutError:
         raise ToolError(
             f"the call did not finish within {TIMEOUT_S:g} s and was abandoned. Likely cause: a file on a slow or "
@@ -86,7 +151,13 @@ class _Server(MCPServer):
         try:
             return await super().call_tool(name, arguments, context)
         except ToolError as e:
-            if isinstance(e.__cause__, ValidationError) and not isinstance(e, UnexpectedToolError):
+            if isinstance(e, UnexpectedToolError):
+                # a crash outside the tool body, e.g. while the SDK serialises the result: still say what happened
+                cause = e.__cause__ or e
+                print(f"cryoem-files-mcp: internal error in {name} (outside the tool body):", file=sys.stderr)
+                traceback.print_exception(cause, file=sys.stderr)
+                raise ToolError(f"Error executing tool {name}: {_internal(name, cause)}") from None
+            if isinstance(e.__cause__, ValidationError):
                 raise ToolError(f"Error executing tool {name}: {_readable_validation(e.__cause__)}") from e.__cause__
             raise
 
@@ -116,7 +187,8 @@ async def identify_file(path: str, verify_data: bool = False) -> dict:
     """Detect a file's real format from its contents, guess its role and check its integrity (truncation,
     corrupted headers, wrong extension). verify_data=true also decodes every frame/pixel. Damage is reported
     under 'problems' with the exact location (byte, frame) instead of failing."""
-    return await _run(lambda: insp.identify_file(resolve(path), verify_data), "identify_file")
+    return await _run(lambda: insp.identify_file(resolve(path), verify_data), "identify_file",
+                      heavy=verify_data)
 
 
 @mcp.tool(title="Inspect an MRC file", annotations=READ_ONLY)
@@ -129,7 +201,8 @@ async def inspect_mrc(path: str, validate: bool = True) -> dict:
 async def inspect_movie(path: str, sample_frames: Frames = 5, verify_all_frames: bool = False) -> dict:
     """Summarise a TIFF, EER or MRC movie: frames, frame size, compression, counts per pixel, gain-normalised guess.
     verify_all_frames=true decodes every frame and lists any corrupted ones."""
-    return await _run(lambda: insp.inspect_movie(resolve(path), sample_frames, verify_all_frames), "inspect_movie")
+    return await _run(lambda: insp.inspect_movie(resolve(path), sample_frames, verify_all_frames), "inspect_movie",
+                      heavy=verify_all_frames)
 
 
 @mcp.tool(title="Inspect a gain reference", annotations=READ_ONLY)
@@ -144,8 +217,10 @@ async def check_gain_orientation(gain: str, movie: str, n_frames: Frames = 20) -
     the gain is multiplicative or divisive. Scores each variant by significance (z = |r| x sqrt(pixels)).
     confidence: high (convert as suggested), medium (probably right; confirm with more frames), low (the top
     variants tie), or no_match (the gain does not belong to this movie; no orientation is suggested).
-    next_step gives the exact convert_gain call for MotionCor and for RELION (they differ for EER movies)."""
-    return await _run(lambda: gain_mod.check_orientation(resolve(gain), resolve(movie), n_frames), "check_gain_orientation")
+    next_step gives the exact convert_gain call for MotionCor and for RELION (they differ for EER movies), and
+    hedged advice for CryoSPARC."""
+    return await _run(lambda: gain_mod.check_orientation(resolve(gain), resolve(movie), n_frames), "check_gain_orientation",
+                      heavy=True)
 
 
 @mcp.tool(title="Convert a gain reference to MRC", annotations=WRITES_NEW_FILE)
@@ -165,7 +240,7 @@ async def convert_gain(
     with movie_type='tiff', a row flip because MotionCor and RELION read TIFF movie rows bottom-up. Use the exact
     call from check_gain_orientation's next_step. Never overwrites unless overwrite=true."""
     return await _run(lambda: gain_mod.convert_gain(resolve(gain), out, rotate, flip, invert, bin, pixel_size,
-                                                    overwrite, movie_type), "convert_gain")
+                                                    overwrite, movie_type), "convert_gain", heavy=True)
 
 
 @mcp.tool(title="Summarise a STAR file", annotations=READ_ONLY)
@@ -220,7 +295,9 @@ def prepare_for(pipeline: Literal["RELION", "CryoSPARC", "MotionCor"], path: str
     return (
         f"Check whether the files in {path} are ready for {pipeline}. Read cryoem://formats for its expectations, "
         "inspect the movies and gain, and list only the conversions needed, as tool calls (from "
-        "check_gain_orientation's next_step for this pipeline; only when its confidence is high)."
+        "check_gain_orientation's next_step: 'motioncor', 'relion' or 'cryosparc' for this pipeline; only when its "
+        "confidence is high). The CryoSPARC advice is not researched in detail: say so, and tell the user to check "
+        "one movie first."
     )
 
 

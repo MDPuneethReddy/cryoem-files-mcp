@@ -35,3 +35,7 @@ packages = ["src/cryoem_files_mcp"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+
+[tool.hatch.build.targets.sdist]
+# development records (QA, research, release plan) and local artefacts are not part of the source release
+exclude = ["docs/dev", "qa", "dist", ".pytest_cache", "**/__pycache__", "*.partial"]

@@ -76,6 +76,9 @@ def output_path(src: Path, out: str | None, suffix: str = ".mrc", overwrite: boo
         dst = resolve(out, must_exist=False)
         if dst.is_dir():
             dst = dst / (_stem(src) + suffix)
+        if dst == src:
+            raise FileExistsError(f"{display(dst)}: is the input file; convert_gain never overwrites its input "
+                                  "(even with overwrite=true). Fix: choose another out= name.")
     else:
         dst = src.with_name(_stem(src) + suffix)
     if dst == src:

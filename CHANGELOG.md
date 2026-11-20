@@ -36,6 +36,25 @@ First release.
 - Named pipes, devices and sockets are never opened; links that lead outside the allowed folders are refused and
   never followed by `scan_directory`. `scan_directory` reports what it skipped (depth limit, header-check cap).
 
+### Changes after the second QA pass (still 0.1.0)
+
+- Non-UTF-8 filenames are shown escaped (`\xNN`) and never break a result; any failure while a result is
+  serialised is reported as "internal error in <tool>: ... Please report at .../issues".
+- MRC modes 3 (complex int16) and 101 (4-bit packed) are decoded by the tool instead of being reported as damaged.
+- `scan_directory` names the damaged, possibly truncated and empty files (up to 10 per problem, plus
+  `flagged_files`).
+- `check_gain_orientation`: when the gain is 2x the movie size, the MotionCor/RELION calls include `bin=2`
+  (RELION resamples EER gains itself); new hedged `next_step.cryosparc` entry; `no_match` mentions low signal.
+- `.mrcs` files are always called particle stacks; STAR values with `#` inside a token (`grid#2_001.mrc`) and `;`
+  lines inside loops are parsed as RELION does.
+- `convert_gain`: NaN/infinite pixels are set to 0 and reported; `out=` equal to the input is refused even with
+  `overwrite=true`; concurrent conversions to the same output use separate temporary files.
+- Clearer messages for colour TIFFs, over-long file names (no absolute paths), malformed mdoc values (no pydantic
+  text), out-of-memory while decoding, and a file of the wrong format given to `inspect_mrc`.
+- At most 2 heavy operations (orientation check, conversion, full verification) run at once, so repeated timeouts
+  cannot pile up memory.
+- `pandas` is a direct dependency. Development records moved to `docs/dev/` and are excluded from the sdist.
+
 ### Known limitations
 
 - Tested only on synthetic data. Not yet validated on real K3, Falcon 4 or EER datasets. Before processing a whole
