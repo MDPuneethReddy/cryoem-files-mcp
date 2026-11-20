@@ -113,3 +113,88 @@ Order: **Developer -> Tester + QA (in parallel) -> Developer (leftovers) -> Rele
 | Registry name capitalisation (`io.github.MDPuneethReddy`) may be rejected | Registry publish fails after PyPI is live | Fallback in `PUBLISHING.md` | (none; release-engineer risk) |
 | Directory policy hold for a pinned `uvx` package | Listing delayed | Expected, documented | (none) |
 | Silent scan limits (depth, header-check cap) | User trusts an incomplete scan | M4/M5 make limits explicit | "scan_directory reports when it did not look at everything; read its notes." |
+
+## Sign-off (2026-11-19)
+
+PM checked commit `f197cd9` independently. Evidence comes from one of four sources:
+- the PM's own runs: the full pytest suite, gates run by hand, wheel installed in a fresh venv (`/tmp/pmvenv`);
+- a black-box stdio MCP client against that wheel;
+- in-process repros;
+- reading the code and docs.
+
+All temporary files were deleted afterwards.
+
+**Correction to PM-1:** the original finding was partly wrong. `--marketplace <source>` does exist on `claude plugin install` (Claude Code 2.1.329, `--help`). The fix is still correct: the two-step form `marketplace add` then `install cryoem-files@cryoem-files-mcp` works on any version, and the one-step form is documented with its v2.1.275+ caveat.
+
+### Blockers
+
+| ID | Verified | Evidence |
+| --- | --- | --- |
+| H1 | PASS | stdio: FIFO and Unix socket refused in 0.00 s ("not a regular file, so it was not opened"). `scan_directory` returned `special_files: 2`, and the session kept answering. 8 `test_h1_*` tests pass. |
+| H2 | PASS | stdio: unrelated gain gives `confidence: no_match`, z_best 1.5, no `next_step`. Matching gain gives `high`, z 136.5. Output includes `pixels_compared` and the thresholds. |
+| M1 | PASS | stdio: `leak.mrc -> /etc/passwd` is counted in `skipped.outside_symlinks: 1`. No bytes or target path appear. |
+| M2 | PASS | In-process: `invert=true, bin=2` output equals `1/bin2(g)` with max diff 0.0. `applied` lists bin before invert. |
+| M3 | PASS | `test_weak_realistic_gain_is_high` and `test_super_resolution_*` pass. Skill, server instructions and prompts act on high/medium/low/no_match using the real field names. |
+| M4 | PASS | stdio: `a/b/c/d/e/f/hidden_movie.tif` found at default depth 8. `max_depth=2` reports "1 folder deeper than max_depth=2 not scanned". |
+| M5 | PASS | `mrc_headers_checked: "3 of 3"` field. Cap test `test_scan_reports_header_check_cap` and 3 `test_m5_*` tests pass. |
+| M6 | PASS | stdio: STAR with `'my mic 1.mrc'` and `"b c.mrc"` gives 2 rows and no problems. |
+| M7 | PASS | stdio: 64³ is a 3D map and 1x256x256 is a 2D image. The `.mrcs` and movie cases are covered by `test_mrc_role_guess`. |
+| M8 | PASS | Fresh venv: `--root /nonexistent` exits 2 with "does not exist". 7 `test_m8_*` tests pass. |
+| M9 | PASS | `plugin/README.md` "What it runs" discloses the PyPI download and the possible uv Python download. This matches `network.hosts`. |
+| L1 | PASS | stdio `tools/list`: all 9 tools have a title. Read-only hint is false only on `convert_gain`. |
+| L2 | PASS | A folder gives "is a folder, not a file". An unrecognised file is never reported "ok" (`test_identify_folder_raises_and_unrecognised_is_not_ok`). |
+| L3 | PASS | stdio: `limit=-5` gives "input should be greater than or equal to 1 (got -5)" on one line. |
+| L4 | PASS | stdio: a missing file shows its relative name plus cause and fix. A symlink escape does not show the target. |
+| PM-1 | PASS | README, plugin README and PUBLISHING show the two-step install plus the one-step form with its version caveat. Both forms are valid per the CLI `--help` (see correction above). |
+| PM-2 | PASS | `claude plugin validate --strict ./plugin` and `--strict --profile directory` both exit 0 with "Validation passed". No hosts warning. |
+| PM-3 | PASS | Fresh venv, cwd `/`, no root: exit 2 with an explanation. `server.json` has `--root isRequired: true`, plus `CRYOEM_MCP_ROOTS` and `CRYOEM_MCP_TIMEOUT` env vars. |
+| PM-4 | PASS | `next_step.check_first` appears in every recommendation. "Check one movie first" is the README's first limit and skill step 3. |
+| PM-5 | PASS | `test_unexpected_exception_is_reported_without_traceback` and `test_serialisation_failure_is_reported_as_internal_error` pass. stdio: a non-UTF-8 name is shown as `bad\xffutf8.gain`, with no failure. |
+| PM-6 | PASS (read) | `ci.yml` runs `check_versions.py "$GITHUB_REF_NAME"`, pins `MCP_PUBLISHER_VERSION v1.8.9` with cosign verification, and polls the PyPI JSON. Not executed: it needs GitHub. |
+| N1 | PASS | stdio: `scan_directory` with a `\xff` filename returns normally, with the name escaped. |
+| N2 | PASS | In-process: a valid 63x64x10 mode-101 file gives `integrity: ok` from `identify_file(verify_data=true)`. |
+| N3 | PASS | In-process: the problem reads "1 damaged MRC file: bad.mrc…", and `flagged_files.damaged_mrc = ["bad.mrc"]`. |
+| N4 | PASS | In-process: a gain 2x the size of a TIFF movie gives `high`, and both the motioncor and relion calls include `bin=2`. |
+| N5 | PASS | `next_step.cryosparc` exists and is hedged. The `prepare_for` prompt names `motioncor`/`relion`/`cryosparc` and requires "check one movie first". |
+
+### Gates
+
+| Gate | Verified | Evidence |
+| --- | --- | --- |
+| G1 Tests | PASS | `python3 -m pytest -q`: **495 passed**, 0 failed, in 58 s (Python 3.13). The 1581 warnings are library deprecations, plus one unraisable `BufferError` in `ncempy` `fileDM.__del__` (a test-only library quirk). CI on 3.10 and 3.12 is not run here. |
+| G2 Versions | PASS | `check_versions.py v0.1.0`: 9 places plus the CHANGELOG entry give "All versions match." |
+| G3 Plugin | PASS | `validate --strict ./plugin` passes; `validate .` (marketplace.json) passes. |
+| G4 Wheel | PASS | `python3 -m build` OK. In a fresh venv, `pip install dist/*.whl` works and `--help` works. No root gives exit 2. `formats.md` is in the wheel. Requires-Dist includes `pandas`. |
+| G5 sdist | PASS | `tar tzf` shows no `docs/dev`, `.pytest_cache` or data files. `twine check --strict dist/*` PASSED for both files. dist/ deleted afterwards. |
+| G6 MCP smoke | PASS | stdio against the wheel: 9 tools, 2 resources, 2 prompts. 15 calls covered every fix above, with the expected results. |
+| G7 Registry metadata | NOT VERIFIED here | The schema host (`static.modelcontextprotocol.io`) is blocked by this sandbox's proxy, and `mcp-publisher` is not installed. The README marker equals `server.json` name. Condition A2. |
+| G8 Docs match behaviour | PASS | Read as a first-time user: the README tool table and verdict thresholds match the stdio output; the skill uses real field names and verdicts; PUBLISHING's runbook matches CI. Minor: the README does not repeat the "MCP SDK 2.3+" line (the CHANGELOG has it; pip installs it automatically). |
+| G9 Error catalogue | PASS (read) | `docs/error-messages.md` was regenerated in f197cd9. A diff was not re-run. |
+| G10 Disclosure | PASS | The plugin README "What it runs" lists the command, network hosts, reads and writes, matching the code and `plugin.json`. The README Safety section is consistent, including the stale-mount and timeout caveats. |
+| G11 Install path | PENDING | Post-PyPI by definition. Condition B1. |
+
+### Open items: decisions
+
+| Item | Decision | Reason |
+| --- | --- | --- |
+| N13 float16 (mode 12) MRC gets `mrc2014_valid: false` | **Defer to 0.1.1** | Reproduced: `mrcfile` RMS overflows to inf. The issue shows in `validation_issues` only, with `problems` empty. It never reports damage or advises a re-copy, so it is a false flag, not wrong advice. Fix: recompute RMS in float64 and ignore that one validator line. |
+| N16 `--root /` accepted without warning | **Defer to 0.1.1** | The user chose it explicitly; the dangerous implicit fallback (PM-3) is fixed. Add a stderr warning for `/` and `$HOME`. |
+| N16 `summarize_star` peak memory about 10x the file size | **Defer to 0.1.1** | A 2M-row file worked (1.26 GB). Only extreme STAR files are affected. |
+| N16 `convert_gain` returns an absolute `output` path; flags wording on a converted MRC | **Defer to 0.1.1** | Cosmetic. The path is inside the user's own root. |
+| `tests/test_regressions.py` docstrings point to `docs/RELEASE-PLAN.md` / `docs/RESEARCH-NOTES.md` (now `docs/dev/`) | **Defer to 0.1.1** | Comment-only. It ships in the sdist but has no effect on behaviour. |
+| N6-N12, N14-N15 | Closed in f197cd9 per its commit message | Not separately re-verified, except N15: the sdist is clean. |
+| Deferred scope (section 1) | Unchanged | Real EMPIAR/EER/.dm4 validation, Leginon tools, macOS/Windows. The README states the limits honestly: synthetic-only, EER and `.dm4` untested on real files, check one movie first. |
+
+### Verdict
+
+**(a) Push to GitHub, then PyPI, then MCP Registry: GO**, on these conditions:
+1. **A1:** Tag only from a clean checkout of the signed-off commit, or a descendant whose diff touches only this file. Let CI's `release-gate` pass on 3.10, 3.12 and 3.13.
+2. **A2:** Run `mcp-publisher validate`, or the jsonschema check in PUBLISHING pre-flight item 4, on a machine with network access before tagging. If it fails, fix it before the tag. A PyPI version is permanent; a registry fix is not.
+3. **A3:** Get the owner's explicit approval to create the public repo, push and tag (nobody has pushed or tagged yet).
+
+**(b) Submit to the Claude plugin directory: GO, after (a) completes**, on these conditions:
+1. **B1 (G11):** PyPI serves 0.1.0, and `uvx cryoem-files-mcp==0.1.0 --help` works.
+2. **B2:** The two-step plugin install from GitHub works in Claude Code and prompts for the data folder.
+3. **B3:** One tool call succeeds through the installed plugin.
+
+Expect the "pinned uvx package" policy hold.
